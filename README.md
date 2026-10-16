@@ -328,7 +328,7 @@ A：检查是否配置了任一通知通道 Secret；否则失败只体现为 Ac
 
 | 版本 | 变更 |
 |---|---|
-| **`workbuddy_checkin.py` v2.3.0-ci** | 新增**企业微信自建应用**通知通道（Secret `WECOM_APP`，格式 `corpid,corpsecret,touser,agentid`，明文消息无需 EncodingAESKey）：gettoken 换取接口令牌后调 message/send，适配「只有自建应用、没有群机器人」的场景；失败提醒明确标注**来源（GitHub 云端定时任务 / 本机运行）+ 原因 + 处理建议**，与其它提醒可区分；成功默认不提醒。 |
+| **`workbuddy_checkin.py` v2.3.0-ci** | 新增**企业微信自建应用**通知通道（Secret `WECOM_APP`，格式 `corpid,corpsecret,touser,agentid`，明文消息无需 EncodingAESKey）：gettoken 换取接口令牌后以**纯文本**调 message/send（个人微信经「微信插件」转发也能直接完整显示，不会提示「请在企业微信中查看」），适配「只有自建应用、没有群机器人」的场景；失败提醒明确标注**来源（GitHub 云端定时任务 / 本机运行）+ 原因 + 处理建议**，与其它提醒可区分；成功默认不提醒。 |
 | **`workbuddy_checkin.py` v2.2.0-ci** | 修复**输出层脱敏缺口**：接口响应改为**白名单压缩**后才写入 `detail`，避免完整响应经 `tee` 进入公开的 Actions **运行日志**（此前只有摘要层做了过滤）。新增 `WB_DUMP_RESP=1` 本机调试开关；口径与摘要层统一。 |
 | **`workbuddy_checkin.py` v2.1.0-ci** | ① 新增**长效令牌通道**（`WB_REFRESH_TOKEN`）：先向插件网关换取接口令牌再签到，适配套客户端 5.6.2+ 的加密登录态，且不依赖客户端常驻；② 识别登录态**加密信封**并给出明确报错与指引，不再静默鉴权失败；③ 余额字段补齐新版复数 `total_credits`（旧版只认单数，导致余额恒为空）；④ `mask_token()` 收紧为**只报长度**，适配公开仓库的日志可见性；⑤ `--diagnose` 改为报告凭据通道与刷新结果。<br>配套：`sync_token_to_github.py` / `copy_token_to_clipboard.py` 改为优先导出**长效令牌**；`security_audit.py` 新增登录态信封检测；workflow 更新 Secret 注入与 guard 步骤。 |
 | v2.0.0 | 首个 GitHub Actions 版本：接口直签、多渠道推送、日志脱敏、部署前自检。 |

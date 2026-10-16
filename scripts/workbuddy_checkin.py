@@ -518,7 +518,7 @@ def notify_via_serverchan(sendkey, title, content):
 
 
 def _plainize_markdown(md):
-    """去掉标题/引用前缀，适配企业微信应用 markdown 的有限语法（保留加粗与换行）。"""
+    """把站内模板的 markdown 转成聊天窗口直读的纯文本（去 #、>、**、` 等标记）。"""
     lines = []
     for ln in (md or "").splitlines():
         ln = ln.strip()
@@ -526,9 +526,10 @@ def _plainize_markdown(md):
             ln = ln[4:]
         elif ln.startswith("> "):
             ln = ln[2:]
+        ln = ln.replace("**", "").replace("`", "")
         if ln:
             lines.append(ln)
-    # 模板首行与推送标题重复（推送时会加粗标题），去掉首行避免重复
+    # 模板首行与推送标题重复（标题会作为消息首行），去掉首行避免重复
     if lines and (lines[0].startswith("⚠️") or lines[0].startswith("✅")):
         lines = lines[1:]
     return "\n".join(lines)
@@ -537,9 +538,9 @@ def _plainize_markdown(md):
 def notify_via_wecom_app(corpid, corpsecret, agentid, touser, title, content):
     """企业微信自建应用推送（corpid + corpsecret + agentid）。
 
-    两步：gettoken 换取 access_token → message/send 发送 markdown 消息
-    （明文消息无需 EncodingAESKey）。只返回 (errcode, errmsg截断) 结论字段，
-    凭据与完整响应绝不进入日志。
+    两步：gettoken 换取 access_token → message/send 发送纯文本消息
+    （个人微信经「微信插件」转发也能直接完整显示；明文消息无需 EncodingAESKey）。
+    只返回 (errcode, errmsg截断) 结论字段，凭据与完整响应绝不进入日志。
     """
     try:
         agentid_val = int(agentid)
@@ -556,11 +557,14 @@ def notify_via_wecom_app(corpid, corpsecret, agentid, touser, title, content):
     if not token:
         return tok.get("errcode"), str(tok.get("errmsg", ""))[:60]
 
+    text = "%s\n\n%s" % (title, _plainize_markdown(content))
+    if len(text.encode("utf-8")) > 1900:  # text 消息上限 2048 字节，留足余量
+        text = text.encode("utf-8")[:1900].decode("utf-8", "ignore") + "\n…（过长已截断）"
     body = {
         "touser": touser or "@all",
-        "msgtype": "markdown",
+        "msgtype": "text",
         "agentid": agentid_val,
-        "markdown": {"content": "**%s**\n\n%s" % (title, _plainize_markdown(content))},
+        "text": {"content": text},
     }
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
