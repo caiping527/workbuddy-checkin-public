@@ -381,7 +381,7 @@ def main():
     if args.success_notify:
         ok &= gh_set_secret(repo, "SUCCESS_NOTIFY", "true", args.dry_run); any_channel = True
     if not any_channel:
-        print("  （未指定任何通知通道，跳过；仅失败时也不会推送）")
+        print("  （本次未指定通知通道，仓库里的现有通知配置保持不变）")
 
     print("[3/3] 完成")
     print("-" * 60)
