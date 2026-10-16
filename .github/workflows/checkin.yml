@@ -45,6 +45,7 @@ jobs:
       WB_DOMAIN: ${{ secrets.WB_DOMAIN }}
       # 通知通道（可选，任一为空则跳过该通道）
       WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+      WECOM_APP: ${{ secrets.WECOM_APP }}
       PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
       BARK_URL: ${{ secrets.BARK_URL }}
       SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}

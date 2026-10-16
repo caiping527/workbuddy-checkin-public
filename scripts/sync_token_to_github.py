@@ -36,6 +36,7 @@
 
   # 顺带写入通知通道（可选，留空则不动）
   python scripts/sync_token_to_github.py --wecom "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx"
+  python scripts/sync_token_to_github.py --wecom-app "corpid,corpsecret,@all,agentid"
   python scripts/sync_token_to_github.py --pushplus "你的token"
   python scripts/sync_token_to_github.py --bark "https://api.day.app/你的KEY/"
   python scripts/sync_token_to_github.py --serverchan "SCTxxxxx"
@@ -286,6 +287,7 @@ def main():
     ap = argparse.ArgumentParser(description="把本机 WorkBuddy 登录态同步到 GitHub Secrets")
     ap.add_argument("--repo", help="目标仓库 owner/repo（默认自动从 git remote 推断）")
     ap.add_argument("--wecom", help="企业微信群机器人 webhook（可选）")
+    ap.add_argument("--wecom-app", help='企业微信自建应用："corpid,corpsecret,touser,agentid"（多于 4 段忽略）')
     ap.add_argument("--pushplus", help="PushPlus token（可选）")
     ap.add_argument("--bark", help="Bark URL（可选）")
     ap.add_argument("--serverchan", help="Server酱（方糖）SendKey（可选）")
@@ -343,6 +345,8 @@ def main():
         channels = []
         if args.wecom:
             channels.append(("WECOM_WEBHOOK", args.wecom))
+        if args.wecom_app:
+            channels.append(("WECOM_APP", args.wecom_app))
         if args.pushplus:
             channels.append(("PUSHPLUS_TOKEN", args.pushplus))
         if args.bark:
@@ -366,6 +370,8 @@ def main():
     any_channel = False
     if args.wecom:
         ok &= gh_set_secret(repo, "WECOM_WEBHOOK", args.wecom, args.dry_run); any_channel = True
+    if args.wecom_app:
+        ok &= gh_set_secret(repo, "WECOM_APP", args.wecom_app, args.dry_run); any_channel = True
     if args.pushplus:
         ok &= gh_set_secret(repo, "PUSHPLUS_TOKEN", args.pushplus, args.dry_run); any_channel = True
     if args.bark:

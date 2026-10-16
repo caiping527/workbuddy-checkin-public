@@ -38,7 +38,7 @@ auth.accessToken / auth.refreshToken 不再是明文 JWT，而是 AES-256-GCM �
 失败推送（可选）：
   若签到结果为 status!=ok，会读取本地配置文件
   ~/.workbuddy/scripts/notify_config.json（若存在），向微信通道推送失败提醒。
-  支持：企业微信群机器人 webhook / PushPlus / Bark / Server酱。配置缺失则静默跳过。
+  支持：企业微信群机器人 webhook / 企业微信自建应用 / PushPlus / Bark / Server酱。配置缺失则静默跳过。
 
 成功推送（可选，默认关闭）：
   在 notify_config.json 中设置 "success_notify": true 后，
@@ -112,7 +112,7 @@ STATUS_PATH = "/billing/meter/checkin-activity-status"
 CHECKIN_PATH = "/billing/meter/daily-checkin"
 HTTP_TIMEOUT = 10
 MAX_RETRY = 1
-VERSION = "2.2.0-ci"
+VERSION = "2.3.0-ci"
 
 # 长效令牌刷新端点（插件网关；与桌面客户端刷新所用同一官方接口）
 PLUGIN_API = "https://copilot.tencent.com"
@@ -517,6 +517,62 @@ def notify_via_serverchan(sendkey, title, content):
         return resp.status, resp.read().decode("utf-8", "replace")
 
 
+def _plainize_markdown(md):
+    """去掉标题/引用前缀，适配企业微信应用 markdown 的有限语法（保留加粗与换行）。"""
+    lines = []
+    for ln in (md or "").splitlines():
+        ln = ln.strip()
+        if ln.startswith("### "):
+            ln = ln[4:]
+        elif ln.startswith("> "):
+            ln = ln[2:]
+        if ln:
+            lines.append(ln)
+    # 模板首行与推送标题重复（推送时会加粗标题），去掉首行避免重复
+    if lines and (lines[0].startswith("⚠️") or lines[0].startswith("✅")):
+        lines = lines[1:]
+    return "\n".join(lines)
+
+
+def notify_via_wecom_app(corpid, corpsecret, agentid, touser, title, content):
+    """企业微信自建应用推送（corpid + corpsecret + agentid）。
+
+    两步：gettoken 换取 access_token → message/send 发送 markdown 消息
+    （明文消息无需 EncodingAESKey）。只返回 (errcode, errmsg截断) 结论字段，
+    凭据与完整响应绝不进入日志。
+    """
+    try:
+        agentid_val = int(agentid)
+    except (TypeError, ValueError):
+        return None, "agentid 格式非法"
+
+    q = urllib.parse.urlencode({"corpid": corpid, "corpsecret": corpsecret})
+    req = urllib.request.Request(
+        "https://qyapi.weixin.qq.com/cgi-bin/gettoken?" + q, method="GET")
+    req.add_header("User-Agent", "WorkBuddy-Checkin-Script/2.3")
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        tok = json.loads(resp.read().decode("utf-8", "replace"))
+    token = tok.get("access_token")
+    if not token:
+        return tok.get("errcode"), str(tok.get("errmsg", ""))[:60]
+
+    body = {
+        "touser": touser or "@all",
+        "msgtype": "markdown",
+        "agentid": agentid_val,
+        "markdown": {"content": "**%s**\n\n%s" % (title, _plainize_markdown(content))},
+    }
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        "https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token="
+        + urllib.parse.quote(token), data=data, method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("User-Agent", "WorkBuddy-Checkin-Script/2.3")
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        res = json.loads(resp.read().decode("utf-8", "replace"))
+    return res.get("errcode"), str(res.get("errmsg", ""))[:60]
+
+
 def _dispatch_channels(cfg, title, content):
     """按本地配置向所有已启用的微信通道推送；返回各通道结果列表（不含任何密钥）。"""
     results = []
@@ -528,6 +584,19 @@ def _dispatch_channels(cfg, title, content):
             results.append("wecom:%s" % st)
         except Exception as e:
             results.append("wecom_err:%s" % e)
+    # 企业微信自建应用（corpid / corpsecret / agentid；明文消息无需 EncodingAESKey）
+    app = cfg.get("wecom_app")
+    if isinstance(app, dict) and app.get("corpid") and app.get("corpsecret") and app.get("agentid"):
+        try:
+            ec, em = notify_via_wecom_app(app["corpid"], app["corpsecret"],
+                                          app["agentid"], app.get("touser") or "@all",
+                                          title, content)
+            results.append("wecom_app:%s" % ec)
+            if ec not in (0,):
+                results.append("wecom_app_msg:%s" % (em or ""))
+        except Exception as e:
+            # 只记异常类型名：send 的 URL 里带 access_token，避免任何回显风险
+            results.append("wecom_app_err:%s" % type(e).__name__)
     # PushPlus（推送到个人微信）
     token = cfg.get("pushplus_token")
     if token:
@@ -555,6 +624,13 @@ def _dispatch_channels(cfg, title, content):
     return results
 
 
+def _notify_origin():
+    """推送来源标识：跑在 GitHub Actions 中＝云端定时任务，否则＝本机运行。"""
+    if os.environ.get("GITHUB_ACTIONS") == "true" or os.environ.get("CI") == "true":
+        return "GitHub 云端定时任务"
+    return "本机运行"
+
+
 def notify_failure(res):
     """签到失败时，按本地配置推送微信提醒；配置缺失则静默跳过。"""
     cfg = load_notify_config()
@@ -565,20 +641,22 @@ def notify_failure(res):
     if cfg.get("enabled") is False:
         return
 
-    title = "⚠️ WorkBuddy签到助手 · 签到失败"
+    origin = _notify_origin()
+    title = "⚠️ WorkBuddy 签到失败（%s）" % origin
     now = time.strftime("%Y-%m-%d %H:%M:%S")  # 本机时区（北京时间）
     msg = res.get("msg", "未知原因")
     src = res.get("detail", {}).get("auth_source") or res.get("detail", {}).get("auth_file", "未知")
 
     content = (
-        "### ⚠️ WorkBuddy签到助手 · 签到失败\n\n"
+        "### ⚠️ WorkBuddy 签到失败\n\n"
+        "> **来源**：WorkBuddy 签到助手 · %s\n\n"
         "> **时间**：%s\n\n"
         "> **原因**：%s\n\n"
         "> **凭据来源**：%s\n\n"
         "> **处理建议**：若为定时任务（GitHub Actions），请在本机重新运行 "
         "`python scripts/sync_token_to_github.py` 更新 Secret `WB_REFRESH_TOKEN`；"
         "若为本机运行，请确认 WorkBuddy 客户端已登录、电脑联网。\n"
-    ) % (now, msg, src)
+    ) % (origin, now, msg, src)
 
     results = _dispatch_channels(cfg, title, content)
     # 仅记录推送动作结果（不含任何密钥 / token），便于排查
@@ -612,18 +690,19 @@ def notify_success(res):
     streak = res.get("detail", {}).get("streak_days")
     balance = res.get("balance")
 
+    origin = _notify_origin()
     if action == "skip_already_signed":
-        title = "✅ WorkBuddy签到助手 · 今日已签"
+        title = "✅ WorkBuddy 今日已签（%s）" % origin
         content = (
-            "### ✅ WorkBuddy签到助手 · 今日已签\n\n"
+            "### ✅ WorkBuddy 今日已签\n\n"
             "> **时间**：%s\n\n"
             "> **状态**：今日已签到，无需重复领取（幂等保护）\n\n"
             "> **说明**：系统定时任务 / 技能已正常执行，无需处理。\n"
         ) % now
     else:
-        title = "✅ WorkBuddy签到助手 · 签到成功"
+        title = "✅ WorkBuddy 签到成功（%s）" % origin
         lines = (
-            "### ✅ WorkBuddy签到助手 · 签到成功\n\n"
+            "### ✅ WorkBuddy 签到成功\n\n"
             "> **时间**：%s\n\n"
             "> **状态**：%s\n"
         ) % (now, msg)
@@ -856,7 +935,13 @@ def write_config_example():
         "wecom_webhook": "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=替换为你的群机器人KEY",
         "pushplus_token": "替换为你的PushPlus_token（个人微信推送）",
         "bark_url": "https://api.day.app/替换为你的Bark_KEY/",
-        "serverchan_sendkey": "替换为你的Server酱SendKey（方糖，个人微信推送，形如 SCTxxxxx）"
+        "serverchan_sendkey": "替换为你的Server酱SendKey（方糖，个人微信推送，形如 SCTxxxxx）",
+        "wecom_app": {
+            "corpid": "替换为企业ID（企业微信管理后台 → 我的企业，形如 wwxxxxxxxx）",
+            "corpsecret": "替换为自建应用Secret（应用管理 → 你的应用 → Secret）",
+            "agentid": "替换为应用AgentId（形如 1000002）",
+            "touser": "@all"
+        }
     }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(example, f, ensure_ascii=False, indent=2)
@@ -959,7 +1044,7 @@ def diagnose():
         report["notify_config"]["present"] = True
         report["notify_config"]["enabled"] = cfg.get("enabled", True)
         report["notify_config"]["success_notify"] = bool(cfg.get("success_notify"))
-        channels = [k for k in ("wecom_webhook", "pushplus_token", "bark_url", "serverchan_sendkey") if cfg.get(k)]
+        channels = [k for k in ("wecom_webhook", "wecom_app", "pushplus_token", "bark_url", "serverchan_sendkey") if cfg.get(k)]
         report["notify_config"]["channels"] = channels
         # 简单校验：enabled 但无通道 = 配了也不会推
         if cfg.get("enabled", True) and not channels:

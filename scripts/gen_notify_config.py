@@ -8,6 +8,7 @@
 
 环境变量（任一为空即跳过该通道）：
   WECOM_WEBHOOK   企业微信群机器人 webhook
+  WECOM_APP       企业微信自建应用（"corpid,corpsecret,touser,agentid"；touser 可填 @all）
   PUSHPLUS_TOKEN  PushPlus token（个人微信推送）
   BARK_URL        Bark URL（iOS 推送）
   SERVERCHAN_SENDKEY  Server酱（方糖）SendKey（个人微信推送，形如 SCTxxxxx）
@@ -43,9 +44,22 @@ def main():
     serverchan = (os.environ.get("SERVERCHAN_SENDKEY") or "").strip()
     success_notify = _truthy(os.environ.get("SUCCESS_NOTIFY"))
 
+    # 企业微信自建应用："corpid,corpsecret,touser,agentid"（多于 4 段忽略，如 EncodingAESKey）
+    wecom_app = None
+    wecom_app_raw = (os.environ.get("WECOM_APP") or "").strip()
+    if wecom_app_raw:
+        parts = [p.strip() for p in wecom_app_raw.split(",")]
+        if len(parts) >= 4 and parts[0] and parts[1] and parts[3]:
+            wecom_app = {"corpid": parts[0], "corpsecret": parts[1],
+                         "touser": parts[2] or "@all", "agentid": parts[3]}
+        else:
+            print("WECOM_APP 格式应为 corpid,corpsecret,touser,agentid（多于 4 段忽略），已跳过")
+
     channels = []
     if wecom:
         channels.append("wecom_webhook")
+    if wecom_app:
+        channels.append("wecom_app")
     if pushplus:
         channels.append("pushplus_token")
     if bark:
@@ -54,7 +68,7 @@ def main():
         channels.append("serverchan_sendkey")
 
     if not channels:
-        print("未配置任何通知通道（WECOM_WEBHOOK / PUSHPLUS_TOKEN / BARK_URL / SERVERCHAN_SENDKEY），跳过推送配置生成。")
+        print("未配置任何通知通道（WECOM_WEBHOOK / WECOM_APP / PUSHPLUS_TOKEN / BARK_URL / SERVERCHAN_SENDKEY），跳过推送配置生成。")
         sys.exit(0)
 
     cfg = {
@@ -63,6 +77,8 @@ def main():
     }
     if wecom:
         cfg["wecom_webhook"] = wecom
+    if wecom_app:
+        cfg["wecom_app"] = wecom_app
     if pushplus:
         cfg["pushplus_token"] = pushplus
     if bark:
