@@ -629,10 +629,19 @@ def _dispatch_channels(cfg, title, content):
 
 
 def _notify_origin():
-    """推送来源标识：跑在 GitHub Actions 中＝云端定时任务，否则＝本机运行。"""
+    """推送来源标识：跑在 GitHub Actions 中＝云端定时任务，否则＝本机运行。
+
+    多账号部署时由 workflow 注入 WB_ACCOUNT_LABEL（如「尾号6717」）并附在来源后，
+    一条失败提醒即可分辨是哪个号；未设置该变量时行为与单账号版完全一致。
+    """
     if os.environ.get("GITHUB_ACTIONS") == "true" or os.environ.get("CI") == "true":
-        return "GitHub 云端定时任务"
-    return "本机运行"
+        origin = "GitHub 云端定时任务"
+    else:
+        origin = "本机运行"
+    label = (os.environ.get("WB_ACCOUNT_LABEL") or "").strip()
+    if label:
+        origin = "%s · %s" % (origin, label)
+    return origin
 
 
 def notify_failure(res):
@@ -651,6 +660,8 @@ def notify_failure(res):
     msg = res.get("msg", "未知原因")
     src = res.get("detail", {}).get("auth_source") or res.get("detail", {}).get("auth_file", "未知")
 
+    # 多账号部署时，workflow 会注入本账号对应的 Secret 名，避免处理建议指向另一个号
+    token_secret = (os.environ.get("WB_TOKEN_SECRET_NAME") or "WB_REFRESH_TOKEN").strip()
     content = (
         "### ⚠️ WorkBuddy 签到失败\n\n"
         "> **来源**：WorkBuddy 签到助手 · %s\n\n"
@@ -658,9 +669,9 @@ def notify_failure(res):
         "> **原因**：%s\n\n"
         "> **凭据来源**：%s\n\n"
         "> **处理建议**：若为定时任务（GitHub Actions），请在本机重新运行 "
-        "`python scripts/sync_token_to_github.py` 更新 Secret `WB_REFRESH_TOKEN`；"
+        "`python scripts/sync_token_to_github.py` 更新 Secret `%s`；"
         "若为本机运行，请确认 WorkBuddy 客户端已登录、电脑联网。\n"
-    ) % (origin, now, msg, src)
+    ) % (origin, now, msg, src, token_secret)
 
     results = _dispatch_channels(cfg, title, content)
     # 仅记录推送动作结果（不含任何密钥 / token），便于排查

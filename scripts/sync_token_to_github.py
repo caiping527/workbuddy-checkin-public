@@ -34,6 +34,9 @@
   python scripts/sync_token_to_github.py --repo owner/repo
   python scripts/sync_token_to_github.py --dry-run            # 只预览，不真正写入
 
+  # 多账号：把本机「当前登录账号」的令牌写入尾号7100 对应的 Secret
+  python scripts/sync_token_to_github.py --secret-suffix "_2" --domain-secret-name WB_DOMAIN_2
+
   # 顺带写入通知通道（可选，留空则不动）
   python scripts/sync_token_to_github.py --wecom "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx"
   python scripts/sync_token_to_github.py --wecom-app "corpid,corpsecret,@all,agentid"
@@ -75,7 +78,7 @@ EKEY_HINT = (
     "  只由运行中的客户端在内存中提供。请三选一取得**明文**长效令牌：\n"
     "    ① 已安装「WorkBuddy签到助手」skill 时（推荐，最省事）：\n"
     "         python \"%s/rt_auth.py\" --export-rt\n"
-    "       把输出的整段字符串填进 Secret WB_REFRESH_TOKEN。\n"
+    "       把输出的整段字符串填进 Secret %s。\n"
     "    ② 设好环境变量 WORKBUDDY_ATREST_KEY（44 字符密钥）后重跑本脚本，自动解密。\n"
     "    ③ 用「WorkBuddy自动签到分享包」在本机导出令牌后手动填入。\n"
     "  提示：客户端需处于已登录状态；解密时脚本与客户端要在同一个 Windows 用户下运行。"
@@ -292,6 +295,10 @@ def main():
     ap.add_argument("--bark", help="Bark URL（可选）")
     ap.add_argument("--serverchan", help="Server酱（方糖）SendKey（可选）")
     ap.add_argument("--success-notify", action="store_true", help="签到成功也推送播报")
+    ap.add_argument("--secret-suffix", default="",
+                    help='多账号：追加到凭据 Secret 名后的后缀，如 "_2" → WB_REFRESH_TOKEN_2')
+    ap.add_argument("--domain-secret-name", default="WB_DOMAIN",
+                    help="域名 Secret 名（多账号可设 WB_DOMAIN_2）")
     ap.add_argument("--dry-run", action="store_true", help="只预览，不真正写入")
     args = ap.parse_args()
 
@@ -324,20 +331,21 @@ def main():
     print("接口域名：%s" % domain)
     print("-" * 60)
 
-    # 决定写哪个凭据 Secret：长效令牌优先
+    # 决定写哪个凭据 Secret：长效令牌优先；多账号时追加后缀，类型判断仍然生效
     if rt:
-        secret_name, secret_value, use_rt = "WB_REFRESH_TOKEN", rt, True
+        secret_name, secret_value, use_rt = "WB_REFRESH_TOKEN" + args.secret_suffix, rt, True
     elif at:
-        secret_name, secret_value, use_rt = "WB_ACCESS_TOKEN", at, False
+        secret_name, secret_value, use_rt = "WB_ACCESS_TOKEN" + args.secret_suffix, at, False
     else:
         print("✗ 无法取得任何明文凭据（登录态可能是 5.6.2+ 加密形态且本机无法解密）。")
         print()
         skill_dir = os.path.join(os.path.expanduser("~"), ".workbuddy", "skills",
                                  "totorosir-workbuddy-checkin", "scripts")
-        print(EKEY_HINT % skill_dir)
+        target_secret = "WB_REFRESH_TOKEN" + args.secret_suffix
+        print(EKEY_HINT % (skill_dir, target_secret))
         if not has_gh:
             print()
-            print_manual_guide("WB_REFRESH_TOKEN", domain, repo, [], True)
+            print_manual_guide(target_secret, domain, repo, [], True)
         sys.exit(1)
 
     # gh 不可用（且非 dry-run）→ 降级为手动配置指引，不在中途失败
@@ -363,8 +371,10 @@ def main():
         print("[1/3] 写入长效令牌与域名（推荐通道）")
     else:
         print("[1/3] 写入接口令牌与域名（兼容通道；请确认客户端为 5.5.x 及更早）")
+    print("  目标仓库：%s / 凭据 Secret：%s / 域名 Secret：%s"
+          % (repo or "（当前仓库）", secret_name, args.domain_secret_name))
     ok &= gh_set_secret(repo, secret_name, secret_value, args.dry_run)
-    ok &= gh_set_secret(repo, "WB_DOMAIN", domain, args.dry_run)
+    ok &= gh_set_secret(repo, args.domain_secret_name, domain, args.dry_run)
 
     print("[2/3] 写入通知通道（仅填写了的）")
     any_channel = False
