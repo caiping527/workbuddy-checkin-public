@@ -30,8 +30,9 @@ auth.accessToken / auth.refreshToken 不再是明文 JWT，而是 AES-256-GCM �
 两个 Secret 都填时 **通道 R 优先**。
 
 其他同步新版的地方：
-  - 积分余额字段：新版接口返回复数 total_credits，旧脚本只认单数 total_credit，
-    导致 balance 恒为 null —— 本版补齐复数候选名。
+  - 签到累计字段：新版接口返回复数 total_credits，旧脚本只认单数 total_credit，
+    导致累计值恒为 null —— 本版补齐复数候选名。注意该值是「本签到活动累计积分」，
+    **不是**客户端设置页的账户积分余额（两者是不同接口、不同口径）。
   - 日志脱敏收紧：Actions 日志在公开仓库里人人可读，mask_token() 不再回显任何
     字符片段，只报存在性与长度。
 
@@ -412,10 +413,12 @@ def _resp_for_detail(body):
 
 
 def _extract_balance(*bodies):
-    """从接口响应中尽力提取「积分余额」（total / balance 类字段）。
+    """从状态接口响应中提取「本签到活动累计积分」（total / balance 类字段）。
 
-    不同版本接口返回的余额字段名不统一。**5.6.2+ 返回的是复数 total_credits**，
-    旧脚本只认单数 total_credit，导致 balance 恒为 null —— 本版补齐复数候选名。
+    ⚠️ 口径说明：新版签到接口返回的 total_credits 是该签到活动累计发放的积分
+    （约等于 签到天数 × 每日积分），**不是**客户端「设置」页显示的账户积分余额。
+    账户余额由另一个账户接口提供，签到接口不返回，本脚本也无法获取。
+    历史字段名不统一：旧脚本只认单数 total_credit，导致值恒为 null，本版补齐复数。
     找不到则返回 None（不影响签到主流程）。
     """
     candidates = (
@@ -726,7 +729,7 @@ def notify_success(res):
         if streak:
             lines += "> **连续天数**：第 %s 天\n\n" % streak
         if balance is not None:
-            lines += "> **当前积分余额**：%s\n\n" % balance
+            lines += "> **签到累计积分**：%s（仅签到活动，非账户余额）\n\n" % balance
         lines += "> **说明**：系统定时任务 / 技能已正常执行，无需处理。\n"
         content = lines
 
@@ -735,7 +738,7 @@ def notify_success(res):
 
 
 def notify_system(res):
-    """签到完成后弹出操作系统级桌面通知（toast / 气球提示），展示结果 + 积分余额。
+    """签到完成后弹出操作系统级桌面通知（toast / 气球提示），展示结果 + 签到累计积分。
 
     跨平台兼容 Windows / macOS / Linux；best-effort、非阻塞、失败静默，
     绝不影响签到结果与退出码。受 --no-notify 一并抑制（与微信推送调试开关一致）。
@@ -749,7 +752,7 @@ def notify_system(res):
             body = str(res.get("msg", "签到完成"))
             bal = res.get("balance")
             if bal is not None:
-                body += " ｜ 当前积分余额：" + str(bal)
+                body += " ｜ 签到累计 %s 分（活动内）" % bal
         _system_toast(title, body)
     except Exception:
         pass  # 通知失败绝不影响签到
@@ -815,7 +818,7 @@ def run(check_only):
             st_code, st_body = api_call(base, STATUS_PATH, token)
             result["detail"]["status_http"] = st_code
             result["detail"]["status_resp"] = _resp_for_detail(st_body)
-            # 从状态响应中提前提取积分余额（领取分支会用领取响应再覆盖一次）
+            # 从状态响应提取「签到活动累计积分」（领取前快照；领取分支会复查一次取最新值）
             result["balance"] = _extract_balance(st_body)
             result["detail"]["balance"] = result["balance"]
 
@@ -830,7 +833,7 @@ def run(check_only):
                     today_signed = True
 
             if check_only:
-                bal_txt = ("，当前积分余额 %s" % result["balance"]) if result.get("balance") is not None else ""
+                bal_txt = ("，签到累计 %s 分（活动内，非账户余额）" % result["balance"]) if result.get("balance") is not None else ""
                 result.update(
                     status="ok",
                     action="skip_check_only",
@@ -840,7 +843,7 @@ def run(check_only):
                 return result
 
             if today_signed:
-                bal_txt = ("，当前积分余额 %s" % result["balance"]) if result.get("balance") is not None else ""
+                bal_txt = ("，签到累计 %s 分（活动内，非账户余额）" % result["balance"]) if result.get("balance") is not None else ""
                 result.update(status="ok", action="skip_already_signed",
                               msg="今日已签到，无需重复领取" + bal_txt)
                 return result
@@ -865,12 +868,23 @@ def run(check_only):
                     credit = (ck_body.get("credit") or data.get("credit")
                               or data.get("daily_credit") or data.get("today_credit"))
                     streak = ck_body.get("streak_days") or data.get("streak_days")
-                    # 领取响应若带回余额则覆盖状态响应中的值
-                    bbal = _extract_balance(ck_body)
-                    if bbal is not None:
-                        result["balance"] = bbal
-                        result["detail"]["balance"] = bbal
-                    bal_txt = ("，当前积分余额 %s" % result["balance"]) if result.get("balance") is not None else ""
+                    # 签到累计只由状态接口返回，而上面那次是「领取前」的快照；
+                    # 领取响应只带本次 credit，不带累计。再查一次只读状态接口取最新值，
+                    # 查询失败则宁可不展示，也不用旧快照冒充当前值。
+                    try:
+                        _, post_st = api_call(base, STATUS_PATH, token)
+                        post_total = _extract_balance(post_st)
+                        result["detail"]["post_checkin_status_resp"] = _resp_for_detail(post_st)
+                    except Exception:
+                        post_total = None
+                    if post_total is None:
+                        result["balance"] = None
+                        result["detail"]["balance"] = None
+                        bal_txt = ""
+                    else:
+                        result["balance"] = post_total
+                        result["detail"]["balance"] = post_total
+                        bal_txt = "，签到累计 %s 分（活动内，非账户余额）" % post_total
                     result.update(status="ok", action="clicked",
                                   points=credit,
                                   msg="领取成功" + (("，+%s 积分" % credit) if credit else "") +
@@ -1084,7 +1098,7 @@ USAGE = (
     "  本机登录态文件     workbuddy-desktop.info（仅明文登录态可用）\n"
     "其他环境变量：WB_DOMAIN / WB_EXPIRES_AT\n"
     "退出码：成功 0 / 失败 1（便于自动化判断是否推送告警）\n"
-    "签到成功后会在结果中展示当前积分余额（若接口返回 balance / total_credits 等字段）。\n"
+    "结果里的 balance 是「本签到活动累计积分」(total_credits)，不是客户端设置页的账户积分余额。\n"
     "微信推送开关见 ~/.workbuddy/scripts/notify_config.json 的 \"success_notify\" 字段。\n"
 )
 

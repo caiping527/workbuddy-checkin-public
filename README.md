@@ -224,12 +224,19 @@ python scripts/sync_token_to_github.py \
 
 | status | action | 含义 | 处理 |
 |---|---|---|---|
-| `ok` | `clicked` | 本次领取成功 | 查看 `points`（本次积分）、`balance`（余额） |
+| `ok` | `clicked` | 本次领取成功 | 查看 `points`（本次积分）、`balance`（签到活动累计积分） |
 | `ok` | `skip_already_signed` | 今日已签到，自动跳过 | 正常，无需处理 |
 | `ok` | `skip_check_only` | 仅查询模式 | 查看 `detail.today_signed` |
 | `error` | `failed` | 签到失败 | 查看 `msg`，见下表 |
 
 `detail.credential` 会写明本次实际使用的凭据通道（如 `refresh_token（长效令牌）`），便于排查。
+
+> ⚠️ **关于「积分余额」**：结果里的 `balance` 来自签到状态接口的 `data.total_credits`，
+> 含义是**本签到活动累计发放的积分**（约等于 签到天数 × 每日积分），
+> 例如连续签到 2 天显示 200。**它不等于客户端「设置 → 积分余额」里的数字** ——
+> 后者是账户积分总额（含体验版额度、购买、其他活动等），由另一个账户接口提供，
+> 签到接口不返回该字段，请以客户端设置页为准。
+> 领取成功后脚本会再查一次状态接口，确保展示的是领取后的累计值，而非领取前快照。
 
 **失败常见原因**
 

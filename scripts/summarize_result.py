@@ -11,6 +11,9 @@
 白名单字段（均为非敏感的运行结论）：
   status / action / points / balance / msg / streak_days / today_signed / domain
 
+注意：balance 是签到接口 data.total_credits，含义为「本签到活动累计积分」，
+不是客户端「设置」页显示的账户积分余额（后者由另一个账户接口提供）。
+
 不输出的内容：
   - token_masked（无必要暴露，即使已脱敏）
   - auth_file（暴露 runner 上的路径）
@@ -64,11 +67,17 @@ def build_summary(data):
     lines.append("| 结果 | %s |" % STATUS_LABEL.get(status, status))
     lines.append("| 动作 | %s |" % ACTION_LABEL.get(action, action))
 
+    # balance 实为「签到活动累计积分」，直译成 balance 会让人误以为是账户余额
+    TOP_LABEL = {
+        "points": "本次获得积分",
+        "balance": "签到累计积分（活动内，非账户余额）",
+        "msg": "说明",
+    }
     for key in ALLOWED_TOP:
         if key in ("status", "action"):
             continue
         if key in data and data[key] is not None:
-            lines.append("| %s | %s |" % (key, _safe(data[key])))
+            lines.append("| %s | %s |" % (TOP_LABEL.get(key, key), _safe(data[key])))
 
     detail = data.get("detail") or {}
     for key in ALLOWED_DETAIL:
