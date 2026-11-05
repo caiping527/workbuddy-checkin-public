@@ -277,6 +277,32 @@ def refresh_access_token(rt):
     return at, new_rt, None
 
 
+def _token_tail(t):
+    """从 JWT 型令牌解出账号尾号（只读末四位，绝不输出其他 payload 字段）。
+
+    长效令牌 / 接口令牌都是 JWT，payload 的 preferred_username 是手机号。
+    这里只用于「凭据归属核对」：防止把 A 号的令牌写进 B 号的 Secret。
+    不校验签名、不用于鉴权、不留存完整用户名；解析失败返回 None（不影响签到）。
+    """
+    if not isinstance(t, str) or t.count(".") != 2:
+        return None
+    try:
+        import base64
+        seg = t.split(".")[1]
+        seg += "=" * (-len(seg) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(seg))
+        digits = "".join(c for c in str(payload.get("preferred_username") or "") if c.isdigit())
+        return digits[-4:] if len(digits) >= 4 else None
+    except Exception:
+        return None
+
+
+def _label_tail(label):
+    """从 WB_ACCOUNT_LABEL（如「尾号6717」）取出期望的 4 位尾号。"""
+    digits = "".join(c for c in (label or "") if c.isdigit())
+    return digits[-4:] if len(digits) >= 4 else None
+
+
 def resolve_credential(result):
     """决定本次用哪个凭据，并把来源写进 result['detail']。
 
@@ -671,9 +697,10 @@ def notify_failure(res):
         "> **时间**：%s\n\n"
         "> **原因**：%s\n\n"
         "> **凭据来源**：%s\n\n"
-        "> **处理建议**：若为定时任务（GitHub Actions），请在本机重新运行 "
-        "`python scripts/sync_token_to_github.py` 更新 Secret `%s`；"
-        "若为本机运行，请确认 WorkBuddy 客户端已登录、电脑联网。\n"
+        "> **处理建议**：若为定时任务（GitHub Actions），请先确认客户端登录的是"
+        "来源里的那个尾号，再双击本机的「一键更新.bat」"
+        "（工具自动认号并写入 Secret `%s`）；"
+        "若为本机运行，请确认客户端已登录、电脑联网。\n"
     ) % (origin, now, msg, src, token_secret)
 
     results = _dispatch_channels(cfg, title, content)
@@ -808,6 +835,24 @@ def run(check_only):
         return result
     result["detail"]["domain"] = domain
     base = "https://%s/v2" % domain
+
+    # 凭据归属校验：长效令牌本身是 JWT，自带 preferred_username（手机号）。
+    # 只取末四位用于比对，绝不输出完整用户名 / email / 令牌内容。
+    # 仅在 workflow 明确配置了 WB_ACCOUNT_LABEL（含尾号）时启用，单账号部署不受影响。
+    rt_raw, at_raw, _ = _env_credential()
+    cred_tail = _token_tail(rt_raw) or _token_tail(at_raw) or _token_tail(token)
+    label = (os.environ.get("WB_ACCOUNT_LABEL") or "").strip()
+    expected = _label_tail(label)
+    result["detail"]["credential_tail"] = cred_tail
+    if expected and cred_tail and cred_tail != expected:
+        result["detail"]["credential_check"] = "mismatch"
+        secret_name = (os.environ.get("WB_TOKEN_SECRET_NAME") or "WB_REFRESH_TOKEN").strip()
+        result.update(status="error", action=None, msg=(
+            "凭据归属不符：本任务标注为 %s，但 Secret 里的令牌属于尾号%s。"
+            "请在本机登录尾号%s 后双击「一键更新.bat」重新写入 %s。"
+        ) % (label, cred_tail, expected, secret_name))
+        return result
+    result["detail"]["credential_check"] = "ok" if (expected and cred_tail) else "skipped"
 
     attempt = 0
     last_err = None
@@ -1099,6 +1144,7 @@ USAGE = (
     "其他环境变量：WB_DOMAIN / WB_EXPIRES_AT\n"
     "退出码：成功 0 / 失败 1（便于自动化判断是否推送告警）\n"
     "结果里的 balance 是「本签到活动累计积分」(total_credits)，不是客户端设置页的账户积分余额。\n"
+    "配置了 WB_ACCOUNT_LABEL 时会核对令牌归属尾号，装错账号会直接报错提醒。\n"
     "微信推送开关见 ~/.workbuddy/scripts/notify_config.json 的 \"success_notify\" 字段。\n"
 )
 

@@ -32,8 +32,14 @@ import sys
 # 白名单：仅这些键允许出现在摘要中（detail 下的用 "detail.xxx" 表示）
 ALLOWED_TOP = ("status", "action", "points", "balance", "msg")
 ALLOWED_DETAIL = ("streak_days", "today_signed", "domain", "credential",
+                  "credential_tail", "credential_check",
                   "notify_config_present", "notify_enabled",
                   "notify_success_notify_flag", "notify_success", "notify")
+
+DETAIL_LABEL = {
+    "credential_tail": "凭据实际尾号",
+    "credential_check": "归属校验",
+}
 
 # 兜底：任何长度超过 80 的连续 base64url 风格串都替换为 REDACTED
 LONG_TOKEN_RX = re.compile(r"[A-Za-z0-9_\-]{80,}")
@@ -82,7 +88,7 @@ def build_summary(data):
     detail = data.get("detail") or {}
     for key in ALLOWED_DETAIL:
         if key in detail and detail[key] is not None:
-            lines.append("| %s | %s |" % (key, _safe(detail[key])))
+            lines.append("| %s | %s |" % (DETAIL_LABEL.get(key, key), _safe(detail[key])))
 
     lines.append("")
     if status == "error":
