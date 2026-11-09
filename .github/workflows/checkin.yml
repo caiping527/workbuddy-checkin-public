@@ -5,12 +5,23 @@ name: WorkBuddy 每日自动签到
 #  原理：从仓库 Secrets 读取凭据，直接调用官方签到接口
 #       （接口直签，无需 GUI，无需本机常驻）
 #
-#  双账号（可选功能，单账号部署无需改动）：
+#  账号体系（两层，互不冲突）：
+#
+#  ① 固定 job（仓库级 Secret，兼容单账号 Fork）
 #    尾号6717 → WB_REFRESH_TOKEN   / WB_ACCESS_TOKEN   / WB_DOMAIN
 #    尾号7100 → WB_REFRESH_TOKEN_2 / WB_ACCESS_TOKEN_2 / WB_DOMAIN_2
-#    两个 job 各注入各的凭据，同一次定时运行并行签到，互不干扰。
-#    未配置尾号7100 凭据时，「尾号7100」job 会跳过并保持绿色，
-#    因此只用一个账号的 Fork 用户不会看到红灯或失败提醒。
+#
+#  ② 动态 job（Environment 级 Secret，用于「随便再加账号」）
+#    仓库变量 WB_ACCOUNTS 里列出的尾号（逗号分隔，如 "7333,8123"），
+#    每个尾号对应一个 Environment `acct-<尾号>`，环境内存放与仓库级**同名**的
+#    WB_REFRESH_TOKEN / WB_DOMAIN。job 通过 `environment: acct-<尾号>` 取用，
+#    环境级 Secret 会覆盖仓库级同名 Secret，因此各账号互不干扰。
+#    新增账号只需在本机登录该号后运行「一键更新.bat」：
+#    工具自动建 Environment、写入令牌、把尾号追加进 WB_ACCOUNTS，
+#    无需修改本文件、无需在网页上手动加 Secret。
+#
+#  固定 job 在 WB_ACCOUNTS 里出现同名尾号时会自动让位（避免重复签到），
+#  未配置 WB_ACCOUNTS 时动态 job 整体跳过，单账号 Fork 用户行为不变。
 #
 #  凭据说明（长效令牌优先，适配客户端 5.6.2+）：
 #    WB_REFRESH_TOKEN(_2) — 长效令牌，每次运行先换取接口令牌（推荐）
@@ -32,7 +43,7 @@ on:
         type: boolean
 
 # 同一时间只保留一个运行实例，避免并发重复领取。
-# 尾号6717 / 尾号7100 属于同一次 run 内的两个 job，不受此互斥影响。
+# 各账号属于同一次 run 内的多个 job，不受此互斥影响。
 concurrency:
   group: workbuddy-checkin
   cancel-in-progress: false
@@ -41,10 +52,48 @@ permissions:
   contents: read
 
 jobs:
+  # ── 读取「动态账号」列表，生成 matrix ──────────────────────────
+  # 账号列表存放在仓库变量 WB_ACCOUNTS（明文，只含手机号尾号，不含任何凭据）。
+  # 列表为空时输出占位 matrix 且 count=0，动态 job 直接跳过
+  # → 单账号/双账号 Fork 用户行为与改造前完全一致。
+  prepare_accounts:
+    name: 读取账号列表
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.build.outputs.matrix }}
+      count: ${{ steps.build.outputs.count }}
+    steps:
+      - name: 生成动态 matrix
+        id: build
+        env:
+          LIST: ${{ vars.WB_ACCOUNTS }}
+        run: |
+          items=""
+          n=0
+          for t in $(printf '%s' "$LIST" | tr ',' ' '); do
+            # 只接受 4 位纯数字尾号，其余（空项、说明文字）一律忽略
+            case "$t" in ''|*[!0-9]*) continue ;; esac
+            [ "${#t}" -eq 4 ] || continue
+            [ -z "$items" ] || items="$items,"
+            items="$items{\"tail\":\"$t\",\"env\":\"acct-$t\"}"
+            n=$((n + 1))
+          done
+          if [ "$n" -eq 0 ]; then
+            # 占位矩阵：避免空 matrix 导致调度异常；count=0 会让动态 job 跳过
+            echo 'matrix=[{"tail":"none","env":"none"}]' >> "$GITHUB_OUTPUT"
+          else
+            echo "matrix=[$items]" >> "$GITHUB_OUTPUT"
+          fi
+          echo "count=$n" >> "$GITHUB_OUTPUT"
+          echo "动态账号数：$n"
+
   checkin_a:
     name: 执行签到 · 尾号6717
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # 若 WB_ACCOUNTS 已把 6717 纳入动态列表，本固定 job 让位，避免重复签到
+    if: ${{ !contains(format(',{0},', vars.WB_ACCOUNTS), ',6717,') }}
 
     env:
       # 尾号6717 凭据（脚本自动识别，长效令牌优先）
@@ -56,7 +105,7 @@ jobs:
       WB_TOKEN_SECRET_NAME: 'WB_REFRESH_TOKEN'
       # 尾号6717 是必跑项；缺凭据应报错告警
       CREDENTIAL_REQUIRED: 'true'
-      # 通知通道（两个账号共用，可选，任一为空则跳过该通道）
+      # 通知通道（各账号共用，可选，任一为空则跳过该通道）
       WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
       WECOM_APP: ${{ secrets.WECOM_APP }}
       PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
@@ -76,10 +125,10 @@ jobs:
           elif [ -n "$WB_ACCESS_TOKEN" ]; then
             echo "✓ 凭据已配置：短效令牌直通（内容不外显）"
           elif [ "$CREDENTIAL_REQUIRED" = "true" ]; then
-            echo "::error::尾号6717 未配置凭据。请在仓库 Settings → Secrets and variables → Actions 添加「WB_REFRESH_TOKEN」（客户端 5.6.2+ 必用，长效令牌）。"
+            echo "::error::${WB_ACCOUNT_LABEL} 未配置凭据。请确认 Secret「${WB_TOKEN_SECRET_NAME}」已创建（客户端 5.6.2+ 必用长效令牌）。"
             exit 1
           else
-            echo "::notice::尾号7100 未配置 WB_REFRESH_TOKEN_2 / WB_ACCESS_TOKEN_2，跳过本账号（单账号部署属正常情况）"
+            echo "::notice::${WB_ACCOUNT_LABEL} 未配置凭据，跳过本账号（单账号部署属正常情况）"
             echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -140,6 +189,8 @@ jobs:
     name: 执行签到 · 尾号7100
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # 若 WB_ACCOUNTS 已把 7100 纳入动态列表，本固定 job 让位，避免重复签到
+    if: ${{ !contains(format(',{0},', vars.WB_ACCOUNTS), ',7100,') }}
 
     env:
       # 尾号7100 凭据：全部独立一套，避免覆盖尾号6717
@@ -170,14 +221,109 @@ jobs:
           elif [ -n "$WB_ACCESS_TOKEN" ]; then
             echo "✓ 凭据已配置：短效令牌直通（内容不外显）"
           elif [ "$CREDENTIAL_REQUIRED" = "true" ]; then
-            echo "::error::尾号6717 未配置凭据。请在仓库 Settings → Secrets and variables → Actions 添加「WB_REFRESH_TOKEN」（客户端 5.6.2+ 必用，长效令牌）。"
+            echo "::error::${WB_ACCOUNT_LABEL} 未配置凭据。请确认 Secret「${WB_TOKEN_SECRET_NAME}」已创建（客户端 5.6.2+ 必用长效令牌）。"
             exit 1
           else
-            echo "::notice::尾号7100 未配置 WB_REFRESH_TOKEN_2 / WB_ACCESS_TOKEN_2，跳过本账号（单账号部署属正常情况）"
+            echo "::notice::${WB_ACCOUNT_LABEL} 未配置凭据，跳过本账号（单账号部署属正常情况）"
             echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           # 只输出存在性结论，不输出 token 长度 / 内容 / 片段（长度也是可用于指纹识别的信息）
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "✓ 接口域名：${WB_DOMAIN:-（默认 www.codebuddy.cn）}"
+
+      - name: 设置 Python
+        if: steps.guard.outputs.skip != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 生成推送配置（可选）
+        if: steps.guard.outputs.skip != 'true'
+        run: |
+          python scripts/gen_notify_config.py "$HOME/.workbuddy/scripts/notify_config.json"
+
+      - name: 环境自检（只读）
+        if: steps.guard.outputs.skip != 'true'
+        run: python scripts/workbuddy_checkin.py --diagnose
+
+      - name: 执行签到
+        id: checkin
+        if: steps.guard.outputs.skip != 'true'
+        run: |
+          ARGS=""
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.check_only }}" = "true" ]; then
+            ARGS="--check-only"
+          fi
+          set +e
+          python scripts/workbuddy_checkin.py $ARGS | tee result.json
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "checkin_exit_code=$rc" >> "$GITHUB_OUTPUT"
+          exit $rc
+
+      - name: 输出运行摘要
+        if: ${{ !cancelled() && steps.guard.outputs.skip != 'true' }}
+        run: |
+          echo "### $WB_ACCOUNT_LABEL 签到结果" >> "$GITHUB_STEP_SUMMARY"
+          python scripts/summarize_result.py result.json >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 失败时终止任务（触发 GitHub 失败通知）
+        if: ${{ steps.guard.outputs.skip != 'true' && steps.checkin.outcome != 'success' }}
+        run: |
+          echo "::error::$WB_ACCOUNT_LABEL 签到未成功（退出码 ${{ steps.checkin.outputs.checkin_exit_code }}），请查看上方日志与运行摘要"
+          exit 1
+
+  # ── 动态账号：WB_ACCOUNTS 里每个尾号一个 Environment ────────────
+  # 环境 acct-<尾号> 内放置与仓库级同名的 WB_REFRESH_TOKEN / WB_DOMAIN，
+  # 环境级 Secret 会覆盖仓库级同名 Secret，因此新增账号无需改本文件。
+  # 未配置 WB_ACCOUNTS 时 count=0，整个 job 跳过（单账号 Fork 用户无感）。
+  checkin_extra:
+    name: 执行签到 · 尾号${{ matrix.tail }}
+    needs: prepare_accounts
+    if: ${{ needs.prepare_accounts.outputs.count != '0' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false   # 某账号失败不影响其他账号
+      matrix: ${{ fromJson(needs.prepare_accounts.outputs.matrix) }}
+    environment: acct-${{ matrix.tail }}
+
+    env:
+      WB_REFRESH_TOKEN: ${{ secrets.WB_REFRESH_TOKEN }}
+      WB_ACCESS_TOKEN: ${{ secrets.WB_ACCESS_TOKEN }}
+      WB_DOMAIN: ${{ secrets.WB_DOMAIN }}
+      WB_ACCOUNT_LABEL: 尾号${{ matrix.tail }}
+      WB_TOKEN_SECRET_NAME: 'WB_REFRESH_TOKEN（环境 acct-${{ matrix.tail }}）'
+      # 动态账号属严格项：拿不到本环境的凭据就报错，
+      # 绝不静默回退到仓库级（那可能拿到别的账号的令牌）
+      CREDENTIAL_REQUIRED: 'true'
+      WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+      WECOM_APP: ${{ secrets.WECOM_APP }}
+      PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+      BARK_URL: ${{ secrets.BARK_URL }}
+      SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
+      SUCCESS_NOTIFY: ${{ secrets.SUCCESS_NOTIFY }}
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 检查凭据是否已配置
+        id: guard
+        run: |
+          if [ -n "$WB_REFRESH_TOKEN" ]; then
+            echo "✓ 凭据已配置：长效令牌（推荐；内容不外显）"
+          elif [ -n "$WB_ACCESS_TOKEN" ]; then
+            echo "✓ 凭据已配置：短效令牌直通（内容不外显）"
+          elif [ "$CREDENTIAL_REQUIRED" = "true" ]; then
+            echo "::error::${WB_ACCOUNT_LABEL} 未配置凭据。请确认 Secret「${WB_TOKEN_SECRET_NAME}」已创建（客户端 5.6.2+ 必用长效令牌）。"
+            exit 1
+          else
+            echo "::notice::${WB_ACCOUNT_LABEL} 未配置凭据，跳过本账号"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           echo "skip=false" >> "$GITHUB_OUTPUT"
           echo "✓ 接口域名：${WB_DOMAIN:-（默认 www.codebuddy.cn）}"
 

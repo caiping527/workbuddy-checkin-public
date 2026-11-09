@@ -37,6 +37,10 @@
   # 多账号：把本机「当前登录账号」的令牌写入尾号7100 对应的 Secret
   python scripts/sync_token_to_github.py --secret-suffix "_2" --domain-secret-name WB_DOMAIN_2
 
+  # 任意多账号（推荐）：写入该账号专属 Environment 的同名 Secret，
+  # workflow 用 `environment: acct-<尾号>` 取用，账号数量不再受 workflow 结构限制
+  python scripts/sync_token_to_github.py --environment acct-7333
+
   # 顺带写入通知通道（可选，留空则不动）
   python scripts/sync_token_to_github.py --wecom "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx"
   python scripts/sync_token_to_github.py --wecom-app "corpid,corpsecret,@all,agentid"
@@ -174,8 +178,37 @@ def gh_available():
     return any(os.path.isfile(c) for c in candidates)
 
 
-def gh_set_secret(repo, name, value, dry_run=False):
+def ensure_environment(repo, environment):
+    """确保 Environment 存在（不存在则创建）。
+
+    多账号扩展用：每个账号一个 Environment，环境内存放与仓库级**同名**的
+    Secret；job 通过 `environment:` 取用，环境级值覆盖仓库级同名值。
+    返回 True 表示可用。
+    """
+    if not environment:
+        return True
+    target = ("repos/%s/environments/%s" % (repo, environment) if repo
+              else "repos/{owner}/{repo}/environments/%s" % environment)
+    try:
+        r = subprocess.run(["gh", "api", "-X", "PUT", target],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if r.returncode != 0:
+            err = r.stderr.decode("utf-8", "replace").strip()
+            print("  ✗ 创建环境 %s 失败：%s" % (environment, err))
+            return False
+        return True
+    except FileNotFoundError:
+        print("  ✗ 未找到 gh 命令，无法创建环境")
+        return False
+    except Exception as e:
+        print("  ✗ 创建环境 %s 异常：%s" % (environment, e))
+        return False
+
+
+def gh_set_secret(repo, name, value, dry_run=False, environment=""):
     """通过 stdin 写入 Secret，避免密钥出现在命令行参数中。
+
+    environment 非空时写入该 Environment 的同名 Secret（多账号扩展用）。
 
     安全要点：
       - 值经 stdin 传递，不出现在进程列表（ps）里
@@ -184,23 +217,26 @@ def gh_set_secret(repo, name, value, dry_run=False):
     cmd = ["gh", "secret", "set", name]
     if repo:
         cmd += ["--repo", repo]
+    if environment:
+        cmd += ["--env", environment]
+    label = "%s（环境 %s）" % (name, environment) if environment else name
     if dry_run:
-        print("  [dry-run] 将写入 Secret：%s" % name)
+        print("  [dry-run] 将写入 Secret：%s" % label)
         return True
     try:
         r = subprocess.run(cmd, input=value.encode("utf-8"),
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if r.returncode != 0:
             err = r.stderr.decode("utf-8", "replace").strip()
-            print("  ✗ 写入 %s 失败：%s" % (name, err))
+            print("  ✗ 写入 %s 失败：%s" % (label, err))
             return False
-        print("  ✓ 已写入 Secret：%s" % name)
+        print("  ✓ 已写入 Secret：%s" % label)
         return True
     except FileNotFoundError:
         print("  ✗ 未找到 gh 命令，请先安装 GitHub CLI：https://cli.github.com/")
         return False
     except Exception as e:
-        print("  ✗ 写入 %s 异常：%s" % (name, e))
+        print("  ✗ 写入 %s 异常：%s" % (label, e))
         return False
 
 
@@ -299,6 +335,8 @@ def main():
                     help='多账号：追加到凭据 Secret 名后的后缀，如 "_2" → WB_REFRESH_TOKEN_2')
     ap.add_argument("--domain-secret-name", default="WB_DOMAIN",
                     help="域名 Secret 名（多账号可设 WB_DOMAIN_2）")
+    ap.add_argument("--environment", default="",
+                    help='写入指定 Environment 的同名 Secret（多账号扩展用，如 acct-7333）')
     ap.add_argument("--dry-run", action="store_true", help="只预览，不真正写入")
     args = ap.parse_args()
 
@@ -373,8 +411,13 @@ def main():
         print("[1/3] 写入接口令牌与域名（兼容通道；请确认客户端为 5.5.x 及更早）")
     print("  目标仓库：%s / 凭据 Secret：%s / 域名 Secret：%s"
           % (repo or "（当前仓库）", secret_name, args.domain_secret_name))
-    ok &= gh_set_secret(repo, secret_name, secret_value, args.dry_run)
-    ok &= gh_set_secret(repo, args.domain_secret_name, domain, args.dry_run)
+    if args.environment:
+        print("  写入位置：Environment「%s」内的同名 Secret（环境级，不影响其他账号）"
+              % args.environment)
+        if not args.dry_run and not ensure_environment(repo, args.environment):
+            sys.exit(1)
+    ok &= gh_set_secret(repo, secret_name, secret_value, args.dry_run, args.environment)
+    ok &= gh_set_secret(repo, args.domain_secret_name, domain, args.dry_run, args.environment)
 
     print("[2/3] 写入通知通道（仅填写了的）")
     any_channel = False
