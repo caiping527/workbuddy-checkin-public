@@ -67,6 +67,8 @@ python scripts/workbuddy_checkin.py --diagnose
 
 - **云端定时签到**：每天北京时间 09:00 自动签到，领 100 积分；当日已签到则幂等跳过，不重复领取。
 - **零硬编码凭据**：凭据全部走 GitHub Secrets / 环境变量，代码仓库里找不到任何密钥。
+- **账号数量不设上限**：固定 job 覆盖尾号6717 / 7100，其余尾号走「一账号一 Environment」的动态 matrix；
+  加账号只需在对应账号登录状态下跑一次本机工具，不用改 workflow、不用手动建 Secret。
 - **适配 5.6.2+ 加密登录态**：走长效令牌通道，不依赖客户端常驻、也不需要本机解密能力。
 - **多渠道推送**：支持企业微信、PushPlus、Server酱（方糖）、Bark，成功 / 失败均可播报。
 - **日志脱敏**：**输出层 + 摘要层双重白名单过滤** —— 接口响应在写进结果前即被压缩为结论字段，
@@ -183,6 +185,50 @@ python scripts/sync_token_to_github.py --dry-run
 3. 到 Actions 手动 **Run workflow** 一次，确认两个 job 都通过。
 
 > 令牌约 60 天过期，续期需要**分别登录两个账号各导出一次**。失败提醒会带「尾号6717 / 尾号7100」标识，处理建议也会指向该账号对应的 Secret。
+
+### 任意多账号（第 3 个、第 4 个…）
+
+固定 job 只负责上面两个账号。**再往后的账号数量不设上限**，靠的是「一账号一 Environment」：
+
+```
+仓库变量 WB_ACCOUNTS = "7333,8123"        ← 只放尾号，明文，不含凭据
+        │
+        ├─ job: prepare_accounts          读变量 → 生成 matrix
+        └─ job: checkin_extra (matrix)    每个尾号一个 job
+              environment: acct-7333      环境内放同名 Secret
+              environment: acct-8123      WB_REFRESH_TOKEN / WB_DOMAIN
+```
+
+环境级 Secret 会**覆盖**仓库级同名 Secret，因此每个 job 只能拿到自己账号的令牌，互不干扰。
+
+**新增一个账号（推荐，全自动）**：
+
+1. 在客户端退出当前账号，登录新账号；
+2. 双击本机「一键更新.bat」（或运行 `python update.py`）。
+
+工具会自动完成三件事，**不需要改 workflow，也不需要去网页加 Secret**：
+- 识别当前登录的手机号末四位（例如 `7333`）；
+- 创建 / 复用 Environment `acct-7333`，写入 `WB_REFRESH_TOKEN`、`WB_DOMAIN`；
+- 把 `7333` 追加到仓库变量 `WB_ACCOUNTS`（幂等，重复运行不会重复添加）。
+
+**纯手动方式**（没有本机工具时）：
+
+```bash
+# 1) 建环境（同名即可，无需 protection rules）
+gh api -X PUT repos/<owner>/<repo>/environments/acct-7333
+# 2) 写环境级 Secret
+gh secret set WB_REFRESH_TOKEN --env acct-7333 --repo <owner>/<repo>
+gh secret set WB_DOMAIN         --env acct-7333 --repo <owner>/<repo>
+# 3) 登记尾号
+gh variable set WB_ACCOUNTS --repo <owner>/<repo> --body "7333,8123"
+```
+
+**几个行为约定**：
+
+- `WB_ACCOUNTS` 未配置或为空时，动态 job 整体跳过 —— 单账号 / 双账号 Fork 用户与改造前完全一致。
+- 若把 `6717` / `7100` 也写进 `WB_ACCOUNTS`，对应的固定 job 会自动让位，改由动态 job 执行，不会重复签到。
+- 新增账号拿不到环境凭据时**直接报错**（`CREDENTIAL_REQUIRED=true`），不会静默回退到仓库级 Secret 去用别的账号的令牌。
+- 每个动态 job 都会做「令牌尾号 vs 账号标签」归属校验，写反格子会被拦下并推送提醒。
 
 ### 手动验证
 
@@ -377,6 +423,7 @@ A：检查是否配置了任一通知通道 Secret；否则失败只体现为 Ac
 
 | 版本 | 变更 |
 |---|---|
+| **workflow v2.4.0-ci** | 新增**任意多账号**：`prepare_accounts` 读仓库变量 `WB_ACCOUNTS` 生成动态 matrix，`checkin_extra` 按尾号逐个调度；每个账号一个 Environment（`acct-<尾号>`），环境级 Secret 覆盖仓库级同名 Secret，因此各账号凭据完全隔离、数量不设上限。固定 job 在变量中出现同名尾号时自动让位；变量为空时动态 job 全部跳过，单/双账号 Fork 用户行为不变。<br>配套 `sync_token_to_github.py` 新增 `--environment`（自动创建环境并写入环境级 Secret），本机「一键更新.bat」改为**任意尾号自动分流**：老账号写仓库级 Secret，新账号自动建 Environment 并登记到 `WB_ACCOUNTS`。<br>踩坑记录：动态 matrix 必须是对象 `{"include":[...]}`，裸数组会导致 job 无法创建。 |
 | **`workbuddy_checkin.py` v2.3.0-ci** | 新增**企业微信自建应用**通知通道（Secret `WECOM_APP`，格式 `corpid,corpsecret,touser,agentid`，明文消息无需 EncodingAESKey）：gettoken 换取接口令牌后以**纯文本**调 message/send（个人微信经「微信插件」转发也能直接完整显示，不会提示「请在企业微信中查看」），适配「只有自建应用、没有群机器人」的场景；失败提醒明确标注**来源（GitHub 云端定时任务 / 本机运行）+ 原因 + 处理建议**，与其它提醒可区分；成功默认不提醒。 |
 | **`workbuddy_checkin.py` v2.2.0-ci** | 修复**输出层脱敏缺口**：接口响应改为**白名单压缩**后才写入 `detail`，避免完整响应经 `tee` 进入公开的 Actions **运行日志**（此前只有摘要层做了过滤）。新增 `WB_DUMP_RESP=1` 本机调试开关；口径与摘要层统一。 |
 | **`workbuddy_checkin.py` v2.1.0-ci** | ① 新增**长效令牌通道**（`WB_REFRESH_TOKEN`）：先向插件网关换取接口令牌再签到，适配套客户端 5.6.2+ 的加密登录态，且不依赖客户端常驻；② 识别登录态**加密信封**并给出明确报错与指引，不再静默鉴权失败；③ 余额字段补齐新版复数 `total_credits`（旧版只认单数，导致余额恒为空）；④ `mask_token()` 收紧为**只报长度**，适配公开仓库的日志可见性；⑤ `--diagnose` 改为报告凭据通道与刷新结果。<br>配套：`sync_token_to_github.py` / `copy_token_to_clipboard.py` 改为优先导出**长效令牌**；`security_audit.py` 新增登录态信封检测；workflow 更新 Secret 注入与 guard 步骤。 |
