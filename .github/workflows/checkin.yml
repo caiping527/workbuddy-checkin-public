@@ -81,9 +81,10 @@ jobs:
           done
           if [ "$n" -eq 0 ]; then
             # 占位矩阵：避免空 matrix 导致调度异常；count=0 会让动态 job 跳过
-            echo 'matrix=[{"tail":"none","env":"none"}]' >> "$GITHUB_OUTPUT"
+            echo 'matrix={"include":[{"tail":"none","env":"none"}]}' >> "$GITHUB_OUTPUT"
           else
-            echo "matrix=[$items]" >> "$GITHUB_OUTPUT"
+            # matrix 必须是对象（include 列表），不能是裸数组，否则 job 无法创建
+            echo "matrix={\"include\":[$items]}" >> "$GITHUB_OUTPUT"
           fi
           echo "count=$n" >> "$GITHUB_OUTPUT"
           echo "动态账号数：$n"
