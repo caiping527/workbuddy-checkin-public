@@ -26,6 +26,9 @@
   idle + 今日未派过 → depart 派出（地点随机，四个地点收益无差异）
   idle + 今日已派过 → 今日已完成
 
+领完后会回读状态：额度已放开就顺手再派一趟（官方闭环），
+能否再派由服务端 daily_limit_reached 兜底，脚本不绕过限制。
+
 ⚠️ daily_limit_reached 的语义是「今天已经派过一次」，**不是**「奖励已领」。
    绝不能用它短路掉 arrived，否则奖励会永远挂在门口领不到。
 
@@ -268,7 +271,23 @@ def run_once(token, label, status_only=False, loc_id=None, offset=0, jitter=0):
         if ok and isinstance(d, dict) and d.get("reward_credit") is not None:
             out["reward"] = d.get("reward_credit")
         print("[旅行] " + msg)
-        return out, not ok
+        if not ok:
+            return out, True
+        # 官方闭环：领完立刻回读状态，额度若已放开就顺手再派一趟。
+        # 是否还能派完全由服务端 daily_limit_reached 说了算，脚本不强行绕过；
+        # 实测多数时候仍为 true，本轮就此结束，等下一轮 cron 再判断。
+        after, err2 = get_status(token)
+        if not err2 and str(after.get("state") or "").lower() == "idle" \
+                and not after.get("daily_limit_reached"):
+            pick2 = loc_id if loc_id in LOCATIONS else random.choice(list(LOCATIONS))
+            ok2, d2, msg2 = do_depart(token, pick2)
+            out["message"] = msg + "；" + msg2
+            out["depart_after_claim"] = ok2
+            print("[旅行] " + msg2)
+            if not ok2:
+                out["ok"] = False
+                return out, True
+        return out, False
 
     if state == "traveling":
         out.update(action="traveling", message="旅行中，等待到达后自动领取" + _countdown(data))
