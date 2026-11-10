@@ -65,7 +65,8 @@ python scripts/workbuddy_checkin.py --diagnose
 
 ## 功能特性
 
-- **云端定时签到**：每天北京时间 09:00 自动签到，领 100 积分；当日已签到则幂等跳过，不重复领取。
+- **云端定时签到**：每天北京时间 01:09 自动签到（五个项目错峰），领 100 积分；当日已签到则幂等跳过，不重复领取。
+- **派猫猫旅行自动领积分**：独立工作流一天多轮巡检，「先领后派」闭环，三个账号错峰 + 随机抖动；详见下方专章。
 - **零硬编码凭据**：凭据全部走 GitHub Secrets / 环境变量，代码仓库里找不到任何密钥。
 - **账号数量不设上限**：固定 job 覆盖尾号6717 / 7100，其余尾号走「一账号一 Environment」的动态 matrix；
   加账号只需在对应账号登录状态下跑一次本机工具，不用改 workflow、不用手动建 Secret。
@@ -90,9 +91,11 @@ python scripts/workbuddy_checkin.py --diagnose
 
 ```
 .
-├── .github/workflows/checkin.yml      # 工作流：定时 + 手动触发，结果写 Action 摘要
+├── .github/workflows/checkin.yml      # 签到工作流：定时 + 手动触发，结果写 Action 摘要
+├── .github/workflows/travel.yml       # 派猫猫旅行工作流：一天多轮，自动领取积分
 ├── scripts/
 │   ├── workbuddy_checkin.py           # 签到主脚本（长效令牌 / 短效令牌 / 文件，三通道）
+│   ├── workbuddy_travel.py            # 派猫猫旅行：状态机 + 错峰随机 + 失败告警
 │   ├── gen_notify_config.py           # CI 环境从环境变量生成推送配置
 │   ├── sync_token_to_github.py        # 本机一键把凭据同步到 GitHub Secrets
 │   ├── copy_token_to_clipboard.py     # 复制凭据到剪贴板（手动配置兜底）
@@ -234,6 +237,82 @@ gh variable set WB_ACCOUNTS --repo <owner>/<repo> --body "7333,8123"
 
 到仓库 **Actions** 页面 → 选择「WorkBuddy 每日自动签到」→ **Run workflow**。
 首次建议勾选 `check_only`（仅查询，不领取）确认接口联通，再跑一次真实签到。看到 `status: ok` 即配置成功。
+
+---
+
+## 派猫猫旅行（自动领取积分）
+
+「Buddy 加油站」成长中心里每天可以派猫猫去旅行，1~4 小时后回来领 **5~10 积分**。
+这是**独立于每日签到**的另一份积分，由 `.github/workflows/travel.yml` + `scripts/workbuddy_travel.py` 负责。
+
+### 接口（已用三个真实账号实测）
+
+旅行接口固定走 `https://www.workbuddy.cn`，**不**用签到域名；只需 `Authorization: Bearer <accessToken>`，
+不需要浏览器 Cookie，所以能全云端跑。凭据与签到**完全共用**，不用新增任何 Secret。
+
+| 方法 | 路径 | 作用 |
+|---|---|---|
+| GET | `/activity/growth/buddy/travel/status` | 查状态（只读） |
+| GET | `/activity/growth/buddy/travel/config` | 地点配置（只读） |
+| POST | `/activity/growth/buddy/travel/claim` | 领取奖励，body `{}` |
+| POST | `/activity/growth/buddy/travel/depart` | 派出，body `{"location_id": 1}` |
+
+四个地点（咖啡馆 / 商场店铺 / 健身房 / 古镇客栈）时长与积分区间**完全相同**，随机即可，无需策略择优。
+
+### 状态机（以服务端 `state` 为唯一权威）
+
+| state | 动作 |
+|---|---|
+| `arrived` | `claim` 领取积分 —— **哪怕 `daily_limit_reached=true` 也必须领** |
+| `traveling` | 什么都不做，打印倒计时，等下一轮 |
+| `idle` + 今日未派过 | `depart` 派出 |
+| `idle` + 今日已派过 | 今日已完成 |
+
+> ⚠️ `daily_limit_reached` 的含义是「今天已经派过一次」，**不是**「奖励已领」。
+> 拿它短路掉 `arrived` 会导致奖励永远挂在门口领不到 —— 这是同类脚本最常见的坑。
+> 服务端用 `HTTP 403 + msg`（`no unclaimed travel` / `daily limit reached`）表示幂等，脚本按「正常跳过」处理，不误报失败。
+
+### 一天多轮 + 三账号错峰 + 随机
+
+旅行要 1~4 小时才回来、且每天只能派一次，**只跑一次只能派出、领不到**。所以一天六个不规整的巡检点：
+
+| 北京时间 | 用途 |
+|---|---|
+| 01:47 | 若额度按北京日重置，这轮派出 |
+| 04:53 / 07:41 | 领奖 / 补派 |
+| 10:52 | 若额度按 UTC 日重置（北京 08:00），这轮派出 |
+| 14:38 | 领奖 |
+| 21:56 | 当日兜底，补领 / 补派 |
+
+三个账号**不同时派**，且领取也不落在整齐时刻：
+
+| 账号 | 固定偏移 | 每轮随机 | 实际派出/领取窗口 |
+|---|---|---|---|
+| 尾号6717 | 0 秒 | 0~120 秒 | 0~2 分钟 |
+| 尾号7100 | 120 秒 | 0~120 秒 | 2~4 分钟 |
+| 动态账号 | 240 秒起（多个依次 +120 秒） | 0~120 秒 | 4~6 分钟 |
+
+窗口互不重叠。随机等待**只在真的要派出 / 领取时**发生；查状态、旅行中、今日已完成零等待，
+不浪费 GitHub Actions 免费时长（估算约 20~35 分钟/天，含所有账号与轮次）。等待结束会**重新查一次状态**再写，避免重复派。
+
+### 与签到、心跳的关系（重要）
+
+- 本工作流**不调用签到接口**，也**不 ping `HC_PING_URL`**。
+- 「签到-WorkBuddy」心跳仍只由 `checkin.yml` 上报，旅行跑得再勤也**不会掩盖「签到没跑」**；反过来签到失败也不影响旅行。
+- 新增账号沿用同一套 `WB_ACCOUNTS` + Environment 机制，签到和旅行会**同时覆盖新账号**，不用改两个地方。
+- 真失败（令牌过期、网络中断、写接口异常）才经 `WECOM_APP` 推微信；正常状态一律静默。
+
+### 手动运行
+
+Actions 页选「WorkBuddy 派猫猫旅行 · 自动领取积分」→ Run workflow：
+- 勾 **仅查询状态** = 只读体检，不派、不领、不等待；
+- 填 **指定地点 1~4** = 手动指定，留空随机。
+
+本机等价命令：`python scripts/workbuddy_travel.py --status`（只读）或 `python scripts/workbuddy_travel.py`（跑一轮）。
+
+> 部署当天三个账号查询都显示「今日已完成（额度已用）」，属正常：服务端 `daily_limit_reached` 要等次日额度重置。
+> 因此**首个完整的「派出 → 领取」闭环会在次日 01:47 那一轮开始**，之后全自动，无需人工介入。
+> `arrived` 状态会一直保留到被领取，积分不会因晚领而丢失。
 
 ---
 
@@ -423,6 +502,7 @@ A：检查是否配置了任一通知通道 Secret；否则失败只体现为 Ac
 
 | 版本 | 变更 |
 |---|---|
+| **旅行 v1.0（2026-11-10）** | 新增 `.github/workflows/travel.yml` + `scripts/workbuddy_travel.py`：**派猫猫旅行全自动闭环**（一天六轮 `arrived→claim` / `idle→depart`），Bearer 令牌直连 `www.workbuddy.cn`、无需 Cookie，凭据与签到共用、零新增 Secret；三个账号固定偏移 0/120/240 秒 + 每轮随机 0~120 秒，窗口互不重叠且只在写操作时等待；独立工作流不 ping 签到心跳，避免掩盖签到故障；真失败才推微信。已用三个真实账号实测 status / config / claim / depart 四个接口的鉴权与幂等回执。 |
 | **workflow v2.4.0-ci** | 新增**任意多账号**：`prepare_accounts` 读仓库变量 `WB_ACCOUNTS` 生成动态 matrix，`checkin_extra` 按尾号逐个调度；每个账号一个 Environment（`acct-<尾号>`），环境级 Secret 覆盖仓库级同名 Secret，因此各账号凭据完全隔离、数量不设上限。固定 job 在变量中出现同名尾号时自动让位；变量为空时动态 job 全部跳过，单/双账号 Fork 用户行为不变。<br>配套 `sync_token_to_github.py` 新增 `--environment`（自动创建环境并写入环境级 Secret），本机「一键更新.bat」改为**任意尾号自动分流**：老账号写仓库级 Secret，新账号自动建 Environment 并登记到 `WB_ACCOUNTS`。<br>踩坑记录：动态 matrix 必须是对象 `{"include":[...]}`，裸数组会导致 job 无法创建。 |
 | **`workbuddy_checkin.py` v2.3.0-ci** | 新增**企业微信自建应用**通知通道（Secret `WECOM_APP`，格式 `corpid,corpsecret,touser,agentid`，明文消息无需 EncodingAESKey）：gettoken 换取接口令牌后以**纯文本**调 message/send（个人微信经「微信插件」转发也能直接完整显示，不会提示「请在企业微信中查看」），适配「只有自建应用、没有群机器人」的场景；失败提醒明确标注**来源（GitHub 云端定时任务 / 本机运行）+ 原因 + 处理建议**，与其它提醒可区分；成功默认不提醒。 |
 | **`workbuddy_checkin.py` v2.2.0-ci** | 修复**输出层脱敏缺口**：接口响应改为**白名单压缩**后才写入 `detail`，避免完整响应经 `tee` 进入公开的 Actions **运行日志**（此前只有摘要层做了过滤）。新增 `WB_DUMP_RESP=1` 本机调试开关；口径与摘要层统一。 |

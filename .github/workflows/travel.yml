@@ -1,0 +1,211 @@
+name: WorkBuddy 派猫猫旅行 · 自动领取积分
+
+# ─────────────────────────────────────────────────────────────
+#  「派猫猫旅行」全自动：每轮「先领后派」，到达后最近一轮把积分领走。
+#
+#  为什么一天要多轮
+#    旅行时长随机 1~4 小时，且每天只能派一次。只跑一次只能派出、领不到；
+#    多轮巡检才能保证「派出 → 回来 → 领取」闭环。GitHub 定时偶尔延迟或
+#    漏跑，下一轮会自动补上； arrived 状态会一直保留，积分不会丢。
+#
+#  三个账号错峰 + 随机（用户要求）
+#    固定偏移：6717 = 0 秒 / 7100 = 120 秒 / 动态账号 = 240 秒起
+#    每轮再叠加随机 0~120 秒（不同账号窗口互不重叠）：
+#      6717  0~2 分   7100  2~4 分   4060  4~6 分（多个动态账号依次顺延）
+#    ⚠️ 只在真的要「派出 / 领取」时才等待；查状态、旅行中、今日已完成
+#       一律零等待，不浪费 GitHub Actions 免费时长。
+#    cron 分钟数也刻意不取整，避免落在整齐的固定时刻。
+#
+#  与签到 / 心跳的关系
+#    本工作流**不调用签到接口、也不 ping HC_PING_URL**。
+#    「签到-WorkBuddy」心跳只由 checkin.yml 上报，旅行跑得再勤也不会
+#    掩盖「签到没跑」；反过来签到失败也不影响旅行。
+#    凭据与签到完全共用，无需新增任何 Secret；新增账号跟着 WB_ACCOUNTS
+#    自动生效（和签到一样的 Environment 机制）。
+#
+#  失败告警：脚本内部只在真失败时经 WECOM_APP 推微信「东东推送」，
+#  正常（旅行中 / 今日已完成 / 幂等跳过）一律静默。
+# ─────────────────────────────────────────────────────────────
+
+on:
+  schedule:
+    # UTC → 北京时间 +8；六个不规整的巡检点，覆盖两种「每日额度重置」时点
+    - cron: '47 17 * * *'   # 北京 01:47 —— 若按北京日重置，这轮派出
+    - cron: '53 20 * * *'   # 北京 04:53 —— 领奖 / 补派
+    - cron: '41 23 * * *'   # 北京 07:41 —— 领奖
+    - cron: '52 2 * * *'    # 北京 10:52 —— 若按 UTC 日重置（北京 08:00），这轮派出
+    - cron: '38 6 * * *'    # 北京 14:38 —— 领奖
+    - cron: '56 13 * * *'   # 北京 21:56 —— 当日兜底，补领 / 补派
+  workflow_dispatch:
+    inputs:
+      status_only:
+        description: '仅查询状态，不派出、不领取'
+        required: false
+        default: false
+        type: boolean
+      location:
+        description: '指定地点 1~4（留空随机）'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: workbuddy-travel
+  cancel-in-progress: false
+
+jobs:
+  # 动态账号列表（与 checkin.yml 完全一致），并给每个账号分配错峰偏移
+  prepare_accounts:
+    name: 读取账号列表
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.build.outputs.matrix }}
+      count: ${{ steps.build.outputs.count }}
+    steps:
+      - name: 生成动态 matrix
+        id: build
+        env:
+          LIST: ${{ vars.WB_ACCOUNTS }}
+        run: |
+          items=""
+          n=0
+          for t in $(printf '%s' "$LIST" | tr ',' ' '); do
+            case "$t" in ''|*[!0-9]*) continue ;; esac
+            [ "${#t}" -eq 4 ] || continue
+            off=$((240 + n * 120))
+            [ -z "$items" ] || items="$items,"
+            items="$items{\"tail\":\"$t\",\"env\":\"acct-$t\",\"offset\":$off}"
+            n=$((n + 1))
+          done
+          if [ "$n" -eq 0 ]; then
+            echo 'matrix={"include":[{"tail":"none","env":"none","offset":0}]}' >> "$GITHUB_OUTPUT"
+          else
+            echo "matrix={\"include\":[$items]}" >> "$GITHUB_OUTPUT"
+          fi
+          echo "count=$n" >> "$GITHUB_OUTPUT"
+          echo "动态账号数：$n"
+
+  travel_a:
+    name: 猫猫旅行 · 尾号6717
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    if: ${{ !contains(format(',{0},', vars.WB_ACCOUNTS), ',6717,') }}
+    env:
+      WB_REFRESH_TOKEN: ${{ secrets.WB_REFRESH_TOKEN }}
+      WB_ACCESS_TOKEN: ${{ secrets.WB_ACCESS_TOKEN }}
+      WB_DOMAIN: ${{ secrets.WB_DOMAIN }}
+      WB_ACCOUNT_LABEL: '尾号6717'
+      WECOM_APP: ${{ secrets.WECOM_APP }}
+      CREDENTIAL_REQUIRED: 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: 检查凭据
+        id: guard
+        run: |
+          if [ -n "$WB_REFRESH_TOKEN" ] || [ -n "$WB_ACCESS_TOKEN" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          elif [ "$CREDENTIAL_REQUIRED" = "true" ]; then
+            echo "::error::尾号6717 未配置 WB_REFRESH_TOKEN"
+            exit 1
+          else
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: 派猫猫旅行（自动领取 / 派出）
+        if: steps.guard.outputs.skip != 'true'
+        env:
+          STATUS_ONLY: ${{ inputs.status_only }}
+          LOCATION: ${{ inputs.location }}
+        run: |
+          ARGS="--offset 0 --jitter 120"
+          if [ "$STATUS_ONLY" = "true" ]; then ARGS="$ARGS --status"; fi
+          case "$LOCATION" in 1|2|3|4) ARGS="$ARGS --location $LOCATION" ;; esac
+          python scripts/workbuddy_travel.py $ARGS
+
+  travel_b:
+    name: 猫猫旅行 · 尾号7100
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    if: ${{ !contains(format(',{0},', vars.WB_ACCOUNTS), ',7100,') }}
+    env:
+      WB_REFRESH_TOKEN: ${{ secrets.WB_REFRESH_TOKEN_2 }}
+      WB_ACCESS_TOKEN: ${{ secrets.WB_ACCESS_TOKEN_2 }}
+      WB_DOMAIN: ${{ secrets.WB_DOMAIN_2 || secrets.WB_DOMAIN }}
+      WB_ACCOUNT_LABEL: '尾号7100'
+      WECOM_APP: ${{ secrets.WECOM_APP }}
+      CREDENTIAL_REQUIRED: 'false'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: 检查凭据
+        id: guard
+        run: |
+          if [ -n "$WB_REFRESH_TOKEN" ] || [ -n "$WB_ACCESS_TOKEN" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          elif [ "$CREDENTIAL_REQUIRED" = "true" ]; then
+            echo "::error::尾号7100 未配置 WB_REFRESH_TOKEN_2"
+            exit 1
+          else
+            echo "::notice::尾号7100 未配置凭据，跳过"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: 派猫猫旅行（自动领取 / 派出）
+        if: steps.guard.outputs.skip != 'true'
+        env:
+          STATUS_ONLY: ${{ inputs.status_only }}
+          LOCATION: ${{ inputs.location }}
+        run: |
+          ARGS="--offset 120 --jitter 120"
+          if [ "$STATUS_ONLY" = "true" ]; then ARGS="$ARGS --status"; fi
+          case "$LOCATION" in 1|2|3|4) ARGS="$ARGS --location $LOCATION" ;; esac
+          python scripts/workbuddy_travel.py $ARGS
+
+  travel_extra:
+    name: 猫猫旅行 · 尾号${{ matrix.tail }}
+    needs: prepare_accounts
+    if: ${{ needs.prepare_accounts.outputs.count != '0' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare_accounts.outputs.matrix) }}
+    environment: acct-${{ matrix.tail }}
+    env:
+      WB_REFRESH_TOKEN: ${{ secrets.WB_REFRESH_TOKEN }}
+      WB_ACCESS_TOKEN: ${{ secrets.WB_ACCESS_TOKEN }}
+      WB_DOMAIN: ${{ secrets.WB_DOMAIN }}
+      WB_ACCOUNT_LABEL: 尾号${{ matrix.tail }}
+      WECOM_APP: ${{ secrets.WECOM_APP }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: 检查凭据
+        id: guard
+        run: |
+          if [ -n "$WB_REFRESH_TOKEN" ] || [ -n "$WB_ACCESS_TOKEN" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::尾号${{ matrix.tail }} 环境缺 WB_REFRESH_TOKEN"
+            exit 1
+          fi
+      - name: 派猫猫旅行（自动领取 / 派出）
+        if: steps.guard.outputs.skip != 'true'
+        env:
+          STATUS_ONLY: ${{ inputs.status_only }}
+          LOCATION: ${{ inputs.location }}
+          OFFSET: ${{ matrix.offset }}
+        run: |
+          ARGS="--offset $OFFSET --jitter 120"
+          if [ "$STATUS_ONLY" = "true" ]; then ARGS="$ARGS --status"; fi
+          case "$LOCATION" in 1|2|3|4) ARGS="$ARGS --location $LOCATION" ;; esac
+          python scripts/workbuddy_travel.py $ARGS

@@ -35,12 +35,21 @@
 错峰 cron 定时巡检：每轮「先领后派」，到达后最近一轮就会把积分领走，
 领完当天的额度也就用满了。GitHub 定时偶尔延迟 / 漏跑，下一轮会自动补上。
 
+三个账号错峰 + 随机
+-------------------
+--offset 是账号固定偏移、--jitter 是每轮额外随机抖动上限，
+travel.yml 给 6717/7100/动态账号分别填 0/120/240 秒 + 随机 0~120 秒，
+派出和领取窗口互不重叠，也不会落在整齐的固定时刻。
+⚠️ 只在真的要写接口（派出 / 领取）时才等待；查状态、旅行中、今日已完成
+   零等待。等待结束后**重新查一次状态**，避免等待期间状态已变还去重复写。
+
 用法
 ----
   python workbuddy_travel.py                # 跑一轮状态机（自动领取 / 派出）
   python workbuddy_travel.py --status       # 只读，不写任何接口
   python workbuddy_travel.py --location 2   # 指定地点（1咖啡馆 2商场 3健身房 4古镇客栈）
   python workbuddy_travel.py --json         # 只输出一行脱敏 JSON，便于 CI 解析
+  python workbuddy_travel.py --offset 120 --jitter 120   # 错峰 + 随机（CI 用）
 
 退出码：0 = 本轮正常（含「旅行中」「今日已完成」）；1 = 真失败（会推微信）。
 输出严格白名单：绝不打印令牌、手机号、userId 或完整接口响应。
@@ -193,8 +202,25 @@ def _countdown(data):
     return "，还有约 %d 小时 %d 分回来" % (secs // 3600, (secs % 3600) // 60)
 
 
-def run_once(token, label, status_only=False, loc_id=None):
-    """跑一轮状态机，返回 (结果字典, 是否失败)。"""
+def needs_write(data):
+    """本轮是否真的要写接口（派出 / 领取）。只有这两种才需要错峰随机等待。"""
+    state = str(data.get("state") or "").lower()
+    return state == "arrived" or (
+        state == "idle" and not bool(data.get("daily_limit_reached")))
+
+
+def jitter_seconds(offset, jitter):
+    """账号固定偏移 + 每轮随机抖动。三个账号偏移不同 → 不会同时派。"""
+    return max(0, int(offset)) + (random.randint(0, int(jitter)) if jitter > 0 else 0)
+
+
+def run_once(token, label, status_only=False, loc_id=None, offset=0, jitter=0):
+    """跑一轮状态机，返回 (结果字典, 是否失败)。
+
+    offset / jitter：三个账号用不同偏移拉开，再叠加每轮随机秒数，
+    让「派出」「领取」不落在整齐的固定时刻。延迟后**重新查一次状态**，
+    避免等待期间猫猫状态变了还去重复写接口。
+    """
     out = {
         "account": label or "未命名账号",
         "ok": True,
@@ -208,6 +234,17 @@ def run_once(token, label, status_only=False, loc_id=None):
     if err:
         out.update(ok=False, message=err)
         return out, True
+
+    if not status_only and (offset or jitter) and needs_write(data):
+        delay = jitter_seconds(offset, jitter)
+        if delay > 0:
+            print("[旅行] 错峰随机等待 %d 分 %d 秒（账号偏移 %d 秒 + 随机 0~%d 秒）"
+                  % (delay // 60, delay % 60, offset, jitter))
+            time.sleep(delay)
+            data, err = get_status(token)
+            if err:
+                out.update(ok=False, message=err)
+                return out, True
 
     state = str(data.get("state") or "").lower()
     limit = bool(data.get("daily_limit_reached"))
@@ -294,7 +331,13 @@ def main():
                     help="指定旅行地点 1~4，缺省随机（四地收益无差异）")
     ap.add_argument("--json", action="store_true", help="只输出一行脱敏 JSON")
     ap.add_argument("--no-notify", action="store_true", help="失败时不推微信")
+    ap.add_argument("--offset", type=int, default=0,
+                    help="账号固定错峰偏移（秒），三个账号填不同值")
+    ap.add_argument("--jitter", type=int, default=0,
+                    help="每轮额外随机抖动上限（秒），0 表示准时执行")
     args = ap.parse_args()
+    offset = max(0, args.offset)
+    jitter = max(0, args.jitter)
 
     label = (os.environ.get("WB_ACCOUNT_LABEL") or "").strip() or "未命名账号"
     holder = {"detail": {}}
@@ -313,7 +356,8 @@ def main():
         return 1
 
     try:
-        out, failed = run_once(token, label, args.status_only, args.location)
+        out, failed = run_once(token, label, args.status_only, args.location,
+                               offset=offset, jitter=jitter)
     except Exception as exc:  # noqa: BLE001
         out = {"account": label, "ok": False, "action": "exception",
                "state": "", "location": "", "reward": None,
