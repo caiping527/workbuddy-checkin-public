@@ -1,0 +1,79 @@
+name: 临时-旅行接口只读探测
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: 只读探测（不发任何写请求）
+        env:
+          WB_REFRESH_TOKEN: ${{ secrets.WB_REFRESH_TOKEN }}
+          WB_ACCESS_TOKEN: ${{ secrets.WB_ACCESS_TOKEN }}
+          WB_DOMAIN: ${{ secrets.WB_DOMAIN }}
+        run: |
+          python - <<'PY'
+          import json, os, sys, urllib.request, urllib.error
+          sys.path.insert(0, "scripts")
+          import workbuddy_checkin as w
+
+          res = {"detail": {}}
+          token, domain, err = w.resolve_credential(res)
+          if err:
+              print("[凭据] 失败：%s" % err[:200]); raise SystemExit(1)
+          print("[凭据] 取得接口令牌成功（内容不打印）；签到域名=%s" % domain)
+
+          BASE = "https://www.workbuddy.cn/activity/growth/buddy/travel"
+          variants = [
+              ("仅 Bearer", {"Authorization": "Bearer " + token,
+                            "Accept": "application/json"}),
+              ("Bearer+常用头", {"Authorization": "Bearer " + token,
+                                "Accept": "application/json",
+                                "Content-Type": "application/json",
+                                "User-Agent": "WorkBuddy-Checkin-Script/2.1"}),
+              ("Bearer+浏览器头", {"Authorization": "Bearer " + token,
+                                  "Accept": "application/json, text/plain, */*",
+                                  "Content-Type": "application/json",
+                                  "x-client-platform": "web",
+                                  "Origin": "https://www.workbuddy.cn",
+                                  "Referer": "https://www.workbuddy.cn/profile/growth-center"}),
+          ]
+          for path in ("/status", "/config"):
+              print("\n===== GET %s =====" % path)
+              for label, hdrs in variants:
+                  req = urllib.request.Request(BASE + path, method="GET")
+                  for k, v in hdrs.items():
+                      req.add_header(k, v)
+                  try:
+                      with urllib.request.urlopen(req, timeout=12) as r:
+                          code, raw = r.status, r.read().decode("utf-8", "replace")
+                  except urllib.error.HTTPError as e:
+                      code, raw = e.code, e.read().decode("utf-8", "replace")
+                  except Exception as e:
+                      print("  %-16s 异常 %s" % (label, type(e).__name__)); continue
+                  try:
+                      body = json.loads(raw)
+                  except Exception:
+                      body = {"raw": raw[:200]}
+                  biz = body.get("code") if isinstance(body, dict) else "?"
+                  msg = (body.get("msg") or body.get("message") or "") if isinstance(body, dict) else ""
+                  print("  %-16s HTTP=%s code=%s msg=%s" % (label, code, biz, str(msg)[:80]))
+                  if isinstance(body, dict) and body.get("code") == 0:
+                      d = body.get("data") or {}
+                      if path == "/status":
+                          keep = {k: d.get(k) for k in
+                                  ("state", "daily_limit_reached", "reward_credit",
+                                   "arrive_at", "depart_at", "server_now", "record_id")}
+                          loc = d.get("location") or {}
+                          keep["location"] = {k: loc.get(k) for k in ("id", "code", "name", "duration_hours")}
+                          print("     data字段=%s" % json.dumps(keep, ensure_ascii=False))
+                          print("     全部字段名=%s" % sorted(d.keys()))
+                      else:
+                          print("     locations=%s" % json.dumps(d.get("locations"), ensure_ascii=False)[:600])
+                      break
+          print("\n[探测结束] 全程只读，未派出、未领取")
+          PY
