@@ -29,14 +29,16 @@ on:
   schedule:
     # GitHub Actions 的 cron 用 UTC。Qoder 领取窗口 =「今天 10:00 → 明天 10:00」。
     #
-    # 主跑：北京 05:07（= UTC 21:07 前一天）—— 按你的要求定在 5 点。
-    #   注意：准点执行时窗口还没开（10:00 才开）。实测本仓库的 cron 会被 GitHub
-    #   延迟 5~7.5 小时（WorkBuddy 那条设 01:09、实际跑在 05:14~08:39），
-    #   所以 5 点这班通常会被推到 10:00 之后，正好落进窗口。
+    # 主跑：北京 06:07（= UTC 22:07 前一天）
+    #   6 点准点跑时窗口还没开，脚本会明确报「新一轮未开放」并以特殊退出码结束（10），
+    #   不会误报成「今天已领过」。
     #
-    # 兜底：北京 12:37（= UTC 04:37）—— 万一主跑当天没延迟、准点空跑，
-    #   这一班已经稳稳在窗口内，保证不漏。
-    - cron: '7 21 * * *'
+    # 补签：北京 12:37（= UTC 04:37）
+    #   这是「10 点前跑过就补一次」的那一班。脚本自己判断：
+    #     · 若今天还没领到 → 正常领取
+    #     · 若今天已领到   → 直接报「今天已领过」，不做多余请求
+    #   所以固定挂在这个点即可，无需额外状态文件。
+    - cron: '7 22 * * *'
     - cron: '37 4 * * *'
   workflow_dispatch:
     inputs:
@@ -122,15 +124,22 @@ jobs:
           QODER_REFRESH_TOKEN: ${{ secrets.QODER_REFRESH_TOKEN }}
           QODER_UID: ${{ secrets.QODER_UID }}
           QODER_MACHINE_ID: ${{ secrets.QODER_MACHINE_ID }}
+          QODER_WECOM_APP: ${{ secrets.QODER_WECOM_APP }}
           QODER_ACCOUNT_LABEL: ${{ vars.QODER_LABEL || 'Qoder 主账号' }}
           QODER_CHECK_ONLY: ${{ (github.event_name == 'workflow_dispatch' && inputs.check_only) && '1' || '0' }}
         run: |
-          # 脚本用非 0 退出码表示失败；管道会吞掉退出码，用 PIPESTATUS 精确取
+          # 管道会吞掉退出码，用 PIPESTATUS 精确取 Python 的退出码
           set +e
           python qoder/checkin.py | tee run.log
           rc=${PIPESTATUS[0]}
           set -e
           echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
+          # 10 = 窗口还没开（北京时间 10:00 前）。这不算失败，
+          # 让 workflow 正常收尾，等 10:00 后的补签那一班真正领取。
+          if [ "$rc" = "10" ]; then
+            echo "::notice::当前还没到 10:00 领取窗口，本次只做检查；10:00 后的补签那一班会真正领取。"
+            exit 0
+          fi
           exit $rc
 
       - name: 运行摘要
@@ -187,6 +196,7 @@ jobs:
           QODER_REFRESH_TOKEN: ${{ secrets.QODER_REFRESH_TOKEN }}
           QODER_UID: ${{ secrets.QODER_UID }}
           QODER_MACHINE_ID: ${{ secrets.QODER_MACHINE_ID }}
+          QODER_WECOM_APP: ${{ secrets.QODER_WECOM_APP }}
           QODER_ACCOUNT_LABEL: ${{ matrix.slot }}
           QODER_CHECK_ONLY: ${{ (github.event_name == 'workflow_dispatch' && inputs.check_only) && '1' || '0' }}
         run: |
@@ -195,6 +205,10 @@ jobs:
           rc=${PIPESTATUS[0]}
           set -e
           echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
+          if [ "$rc" = "10" ]; then
+            echo "::notice::${{ matrix.slot }} 还没到 10:00 领取窗口，本次只做检查。"
+            exit 0
+          fi
           exit $rc
 
       - name: 运行摘要
