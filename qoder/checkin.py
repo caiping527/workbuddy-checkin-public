@@ -25,6 +25,7 @@ import os
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
@@ -36,6 +37,12 @@ UID = (os.environ.get('QODER_UID') or '').strip()
 LABEL = (os.environ.get('QODER_ACCOUNT_LABEL') or 'Qoder 账号').strip()
 CHECK_ONLY = os.environ.get('QODER_CHECK_ONLY', '') == '1'
 TIMEOUT = 25
+
+# 退出码约定：
+#   0  = 领到了 / 今天已领过 / 确实没有活动
+#   10 = 窗口还没开（北京时间 10:00 前），这次不算失败，等补签那一班
+#   1  = 真失败（凭据被拒、网络、上游异常）
+EXIT_WINDOW_CLOSED = 10
 
 # 桌面端身份：活动平台缺任一都会「200 + 空列表」。
 # ⚠️ 绝对不能带任何 cosy-machine* 头 —— 派生值会让服务端把「每天领 100 Credits」
@@ -56,6 +63,101 @@ RESULT = {
     'refreshed': False,
     'detail': [],
 }
+
+
+# ── 企业微信通知（与 WorkBuddy 签到同一套做法） ──────────────
+# 只读 工具箱/配置.json 的 wecom 字段（4 段：corpid,corpsecret,touser,agentid）。
+# 云端跑时该文件不存在，改为读 QODER_WECOM_APP 环境变量（由 workflow 从 Secret 注入）。
+
+NOTIFY_FILE = os.environ.get('QODER_NOTIFY_FILE') or ''
+
+
+def _wecom_config():
+    raw = (os.environ.get('QODER_WECOM_APP') or '').strip()
+    if not raw and NOTIFY_FILE:
+        try:
+            with open(NOTIFY_FILE, encoding='utf-8') as f:
+                cfg = json.load(f)
+            raw = str(cfg.get('wecom') or '').strip()
+        except Exception:
+            raw = ''
+    if not raw:
+        return None
+    parts = [x.strip() for x in raw.split(',')]
+    if len(parts) < 4 or not parts[0] or not parts[1] or not parts[3]:
+        return None
+    return {'corpid': parts[0], 'corpsecret': parts[1],
+            'touser': parts[2] or '@all', 'agentid': parts[3]}
+
+
+def _post_json(url, payload):
+    data = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+    req = urllib.request.Request(url, data=data, method='POST',
+                                 headers={'Content-Type': 'application/json'})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return r.status, r.read().decode('utf-8', 'replace')
+
+
+def notify_wecom(title, content):
+    """发企业微信自建应用消息。返回 'ok' / 失败原因。绝不回显 secret。"""
+    cfg = _wecom_config()
+    if not cfg:
+        return 'skipped(未配置企业微信)'
+    try:
+        st, body = _post_json(
+            'https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid=%s&corpsecret=%s'
+            % (urllib.parse.quote(cfg['corpid']), urllib.parse.quote(cfg['corpsecret'])),
+            {})
+        token = ''
+        try:
+            token = (json.loads(body) or {}).get('access_token') or ''
+        except Exception:
+            token = ''
+        if not token:
+            return 'gettoken失败(HTTP %s)' % st
+        st, body = _post_json(
+            'https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token=%s' % token,
+            {'touser': cfg['touser'], 'msgtype': 'markdown', 'agentid': cfg['agentid'],
+             'markdown': {'content': content}})
+        try:
+            obj = json.loads(body) or {}
+        except Exception:
+            obj = {}
+        code = obj.get('errcode')
+        if code == 0:
+            return 'ok'
+        return 'send失败(errcode=%s %s)' % (code, str(obj.get('errmsg') or '')[:60])
+    except Exception as e:
+        return '异常(%s)' % type(e).__name__
+
+
+def _origin():
+    if os.environ.get('GITHUB_ACTIONS') == 'true':
+        return 'GitHub 云端定时任务'
+    return '本机运行'
+
+
+def notify_failure(result):
+    """签到失败时推企业微信。与 WorkBuddy 一致：失败必响。"""
+    title = "⚠️ Qoder 签到失败"
+    lines = [
+        "### ⚠️ Qoder 签到失败",
+        "",
+        "> **来源**：Qoder 签到助手 · " + _origin(),
+        ">",
+        "> **账号**：" + str(result.get("account") or "-"),
+        ">",
+        "> **时间**：" + now(),
+        ">",
+        "> **原因**：" + str(result.get("message") or "未知原因"),
+        ">",
+        "> **处理建议**：若为令牌失效，请在 AiRoute「渠道账号」重新登录该 Qoder 账号，",
+        "> 再双击本机「QODER签到更新 / 同步全部账号.bat」",
+    ]
+    content = chr(10).join(lines)
+    outcome = notify_wecom(title, content)
+    log("  企业微信推送：" + outcome)
+    result.setdefault("detail", []).append("企业微信：" + outcome)
 
 
 def now():
@@ -198,6 +300,12 @@ def claim(token, cid):
 
 def save(result):
     path = os.environ.get('QODER_RESULT_FILE') or 'result.json'
+    # 失败才推送：成功/已领不打扰（与 WorkBuddy 的 SUCCESS_NOTIFY 默认关一致）
+    if result.get('outcome') == 'failed':
+        try:
+            notify_failure(result)
+        except Exception as e:
+            log('[!] 推送异常：%s' % e)
     try:
         with open(path, 'w', encoding='utf-8') as f:
             json.dump(result, f, ensure_ascii=False, indent=2)
@@ -214,7 +322,6 @@ def main():
         RESULT['message'] = '未配置凭据（QODER_ACCESS_TOKEN / QODER_REFRESH_TOKEN 都为空）'
         log('[x] ' + RESULT['message'])
         return save(RESULT) or 1
-
     token = ACCESS_TOKEN
 
     # 没有 dt- 就直接续期
@@ -253,10 +360,13 @@ def main():
         RESULT['outcome'] = 'ineligible'
         now_bj = datetime.now(BEIJING)
         if now_bj.hour < 10:
+            # 窗口未开：退出码 10，让 workflow 区分「还没到点」和「真失败」
             RESULT['message'] = ('当前北京时间 %s，今天 10:00 的新一轮还没开放'
                                  % now_bj.strftime('%H:%M'))
-        else:
-            RESULT['message'] = '今天没有可领取的活动'
+            RESULT['window_closed'] = True
+            log('[=] ' + RESULT['message'])
+            return save(RESULT) or EXIT_WINDOW_CLOSED
+        RESULT['message'] = '今天没有可领取的活动'
         log('[=] ' + RESULT['message'])
         return save(RESULT) or 0
 
@@ -266,16 +376,18 @@ def main():
     if not claimable:
         # Qoder 的领取窗口是「今天 10:00 → 明天 10:00」。在北京时间 10:00 之前跑，
         # 看到的仍是「昨天那轮」的状态：昨天已领 → 这里全变成 CLAIMED。
-        # 这时报「今天已领过」会误导成「今天搞定了」，其实新一轮还没开始。
+        # 6 点那一班就是这种情况，用退出码 10 告诉 workflow「还没到点，等补签」，
+        # 不能报成「今天已领过」，否则补签那一班会误以为已经完成。
         now_bj = datetime.now(BEIJING)
-        if now_bj.hour < 10 and claimed_count:
+        if now_bj.hour < 10:
             RESULT['outcome'] = 'ineligible'
+            RESULT['window_closed'] = True
             RESULT['message'] = (
-                '当前北京时间 %s，今天 10:00 的新一轮还没开放（看到的是昨天那轮，已领）。'
-                % now_bj.strftime('%H:%M')
+                '当前北京时间 %s，今天 10:00 的新一轮还没开放（看到的是昨天那轮）。'
+                '等 10:00 后的补签那一班处理。' % now_bj.strftime('%H:%M')
             )
             log('[=] ' + RESULT['message'])
-            return save(RESULT) or 0
+            return save(RESULT) or EXIT_WINDOW_CLOSED
         RESULT['outcome'] = 'done' if claimed_count else 'ineligible'
         RESULT['message'] = '今天已领过' if claimed_count else '今天没有可领取的积分活动'
         log('[=] ' + RESULT['message'])
