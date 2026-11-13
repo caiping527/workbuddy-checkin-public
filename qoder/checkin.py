@@ -251,7 +251,12 @@ def main():
 
     if not items:
         RESULT['outcome'] = 'ineligible'
-        RESULT['message'] = '今天没有可领取的活动（活动每天 10:00 刷新）'
+        now_bj = datetime.now(BEIJING)
+        if now_bj.hour < 10:
+            RESULT['message'] = ('当前北京时间 %s，今天 10:00 的新一轮还没开放'
+                                 % now_bj.strftime('%H:%M'))
+        else:
+            RESULT['message'] = '今天没有可领取的活动'
         log('[=] ' + RESULT['message'])
         return save(RESULT) or 0
 
@@ -259,6 +264,18 @@ def main():
     note('活动共 %d 条，其中可领 %d 条、已领 %d 条' % (len(items), len(claimable), claimed_count))
 
     if not claimable:
+        # Qoder 的领取窗口是「今天 10:00 → 明天 10:00」。在北京时间 10:00 之前跑，
+        # 看到的仍是「昨天那轮」的状态：昨天已领 → 这里全变成 CLAIMED。
+        # 这时报「今天已领过」会误导成「今天搞定了」，其实新一轮还没开始。
+        now_bj = datetime.now(BEIJING)
+        if now_bj.hour < 10 and claimed_count:
+            RESULT['outcome'] = 'ineligible'
+            RESULT['message'] = (
+                '当前北京时间 %s，今天 10:00 的新一轮还没开放（看到的是昨天那轮，已领）。'
+                % now_bj.strftime('%H:%M')
+            )
+            log('[=] ' + RESULT['message'])
+            return save(RESULT) or 0
         RESULT['outcome'] = 'done' if claimed_count else 'ineligible'
         RESULT['message'] = '今天已领过' if claimed_count else '今天没有可领取的积分活动'
         log('[=] ' + RESULT['message'])
