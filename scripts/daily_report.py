@@ -24,6 +24,7 @@ result.json 里的积分字段（由各签到脚本写入，二选一，本脚�
 import glob
 import json
 import os
+import re
 import sys
 import urllib.parse
 import urllib.request
@@ -62,7 +63,11 @@ def load_rows(root):
             exp = detail["expiry"]
         elif isinstance(data.get("expiry"), dict):
             exp = data["expiry"]
-        account = str(data.get("account") or os.path.basename(os.path.dirname(path)) or "未命名账号")
+        # 优先用脚本写好的账号标签；没有则退回 artifact 目录名，并去掉
+        # 「wb-expiry- / qoder-expiry- / expiry-」前缀，避免显示成 wb-expiry-9653
+        dir_name = os.path.basename(os.path.dirname(path))
+        fallback = re.sub(r"^(?:wb|qoder|raccoon)?-?expiry-", "", dir_name)
+        account = str(data.get("account") or fallback or dir_name or "未命名账号")
         status = str(data.get("status") or data.get("outcome") or "unknown")
         message = str(data.get("message") or data.get("msg") or "")
         err = str(exp.get("error") or "")
