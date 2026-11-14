@@ -82,6 +82,7 @@ import time
 import urllib.request
 import urllib.error
 import urllib.parse
+from datetime import datetime, timedelta, timezone
 
 # ---- 配置 ----
 def _auth_candidates():
@@ -111,9 +112,14 @@ def _auth_candidates():
 
 STATUS_PATH = "/billing/meter/checkin-activity-status"
 CHECKIN_PATH = "/billing/meter/daily-checkin"
+# 只读余额接口：拿「当前可用积分」和「还没用掉的最早一批积分的到期日」。
+# 与 AiRoute workbuddy/client.js 的 get-user-resource / aggregateCredits 同口径。
+# ⚠️ 这里只做查询，绝不触发签到；签到仍只由 CHECKIN_PATH 完成。
+RESOURCE_PATH = "/billing/meter/get-user-resource"
 HTTP_TIMEOUT = 10
 MAX_RETRY = 1
-VERSION = "2.3.0-ci"
+VERSION = "2.4.0-ci"
+BEIJING = timezone(timedelta(hours=8))
 
 # 长效令牌刷新端点（插件网关；与桌面客户端刷新所用同一官方接口）
 PLUGIN_API = "https://copilot.tencent.com"
@@ -475,6 +481,98 @@ def _extract_balance(*bodies):
                 if isinstance(v, (int, float)):
                     return v
     return None
+
+
+def _parse_expiry_ms(value):
+    """批次到期时间 → 毫秒时间戳。兼容 ISO/墙钟字符串与秒/毫秒数字。
+
+    与 AiRoute workbuddy/client.js 的 parseTimeValue 同口径；解析不了返回 0。
+    """
+    if value is None or value == "":
+        return 0
+    if isinstance(value, (int, float)):
+        v = float(value)
+        return int(v * 1000 if v < 1e11 else v)
+    s = str(value).strip()
+    if not s:
+        return 0
+    if s.isdigit():
+        n = int(s)
+        return n * 1000 if n < 1e11 else n
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(s[:19] if len(s) >= 19 else s[:10], fmt)
+            return int(dt.replace(tzinfo=BEIJING).timestamp() * 1000)
+        except ValueError:
+            continue
+    return 0
+
+
+def query_balance_expiry(base, token):
+    """只读查询积分批次，返回「当前积分 + 最早到期待用批次」的白名单结构。
+
+    与 AiRoute workbuddy/client.js 的 userResource / aggregateCredits 完全一致：
+      · 当前积分 = Σ 各批次剩余（CycleCapacitySize>0 用 Cycle 口径，否则 Capacity 口径）
+      · 开始过期日 = 还没用掉（剩余>0）的批次里最早的那个到期日
+      · 该批积分 = 同一到期日的剩余合计
+    只做查询，绝不触发签到。任何异常都降级为 error 字段，不影响签到与退出码。
+    绝不把接口原始响应写进结果（公开仓库日志人人可读）。
+    """
+    if not token:
+        return {"error": "无可用接口令牌"}
+    try:
+        now = datetime.now(BEIJING)
+        far = now + timedelta(days=365 * 101)
+        fmt = lambda d: d.strftime("%Y-%m-%d %H:%M:%S")
+        body = {"PageNumber": 1, "PageSize": 100, "ProductCode": "p_tcaca",
+                "Status": [0, 3],
+                "PackageEndTimeRangeBegin": fmt(now),
+                "PackageEndTimeRangeEnd": fmt(far)}
+        code, resp = api_call(base, RESOURCE_PATH, token, payload=body)
+        if code != 200 or not isinstance(resp, dict):
+            return {"error": "余额接口 HTTP %s" % code}
+        accounts = ((((resp.get("data") or {}).get("Response") or {})
+                     .get("Data") or {}).get("Accounts"))
+        if not isinstance(accounts, list):
+            return {"error": "余额响应缺少 Accounts"}
+        now_ms = int(now.timestamp() * 1000)
+        credits, earliest, earliest_remaining = 0.0, 0, 0.0
+        for acc in accounts:
+            if not isinstance(acc, dict):
+                continue
+            try:
+                use_cycle = float(acc.get("CycleCapacitySize") or 0) > 0
+            except (TypeError, ValueError):
+                use_cycle = False
+            try:
+                remain = float(acc.get("CycleCapacityRemain") if use_cycle
+                               else (acc.get("CapacityRemain") or 0))
+            except (TypeError, ValueError):
+                remain = 0.0
+            credits += remain
+            if remain <= 0:
+                continue
+            exp = (_parse_expiry_ms(acc.get("ExpiredTime"))
+                   or _parse_expiry_ms(acc.get("PackageEndTime"))
+                   or _parse_expiry_ms(acc.get("CycleEndTime")))
+            if exp and exp > now_ms:
+                if not earliest or exp < earliest:
+                    earliest, earliest_remaining = exp, remain
+                elif exp == earliest:
+                    earliest_remaining += remain
+        out = {"credits": round(credits, 2),
+               "earliest_remaining": round(earliest_remaining, 2),
+               "label": "开始过期"}
+        if earliest:
+            exp_day = datetime.fromtimestamp(earliest / 1000.0, BEIJING).date()
+            out.update({"earliest_expire_date": exp_day.isoformat(),
+                        "days_left": (exp_day - now.date()).days,
+                        "use_by": (exp_day - timedelta(days=1)).isoformat()})
+        else:
+            out["error"] = "未取到带到期日的待用积分"
+    except Exception as e:
+        return {"error": "查询异常 %s" % type(e).__name__}
+    return out
 
 
 # ---------------- 失败推送（微信） ----------------
@@ -853,6 +951,17 @@ def run(check_only):
         ) % (label, cred_tail, expected, secret_name))
         return result
     result["detail"]["credential_check"] = "ok" if (expected and cred_tail) else "skipped"
+
+    # ── 每日积分播报数据源 ──────────────────────────────────
+    # 只读查询一次，放在主循环之外：后续所有返回分支（已签到 / 领取成功 /
+    # 仅查询 / 失败）都会带上这笔数据，供汇总脚本逐账号展示。
+    # 失败只留 error 字段，绝不改变签到结论与退出码。
+    # WB_QUERY_BALANCE=0 可整体关闭（例如上游余额接口临时异常时）。
+    if os.environ.get("WB_QUERY_BALANCE", "1") != "0":
+        try:
+            result["detail"]["expiry"] = query_balance_expiry(base, token)
+        except Exception as e:
+            result["detail"]["expiry"] = {"error": "查询异常 %s" % type(e).__name__}
 
     attempt = 0
     last_err = None
