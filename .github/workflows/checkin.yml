@@ -92,7 +92,7 @@ jobs:
   checkin_a:
     name: 执行签到 · 尾号6717
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     # 若 WB_ACCOUNTS 已把 6717 纳入动态列表，本固定 job 让位，避免重复签到
     if: ${{ !contains(format(',{0},', vars.WB_ACCOUNTS), ',6717,') }}
 
@@ -116,10 +116,10 @@ jobs:
 
     steps:
 
-      # ── 错峰等待（尾号6717 排在第一个，等 2 分钟让调度波峰过去）──────────
+      # ── 错峰等待（尾号6717 排在第一个，等 90 秒让调度波峰过去）──────────
       # 多账号同时打同一个接口容易被当成异常流量，错开几分钟更稳。
-      - name: 错峰等待 120 秒
-        run: sleep 120
+      - name: 错峰等待 90 秒
+        run: sleep 90
       - name: 检出仓库
         uses: actions/checkout@v4
 
@@ -194,7 +194,7 @@ jobs:
   checkin_b:
     name: 执行签到 · 尾号7100
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     # 若 WB_ACCOUNTS 已把 7100 纳入动态列表，本固定 job 让位，避免重复签到
     if: ${{ !contains(format(',{0},', vars.WB_ACCOUNTS), ',7100,') }}
 
@@ -217,10 +217,10 @@ jobs:
 
     steps:
 
-      # ── 错峰等待（尾号7100 排在 6717 之后，等 5 分钟）──────────
+      # ── 错峰等待（尾号7100 排在 6717 之后，等 3 分钟）──────────
       # 多账号同时打同一个接口容易被当成异常流量，错开几分钟更稳。
-      - name: 错峰等待 300 秒
-        run: sleep 300
+      - name: 错峰等待 180 秒
+        run: sleep 180
       - name: 检出仓库
         uses: actions/checkout@v4
 
@@ -294,7 +294,7 @@ jobs:
     needs: prepare_accounts
     if: ${{ needs.prepare_accounts.outputs.count != '0' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     strategy:
       fail-fast: false   # 某账号失败不影响其他账号
       # 多账号【串行】：同时打同一接口容易被判异常。这是 GitHub 唯一能控制
@@ -322,11 +322,12 @@ jobs:
     steps:
 
       # ── 错峰等待（其余账号按序号递增，每多一个加 180 秒）──────────
-      # 第 1 个账号 0 秒，第 2 个 180 秒，第 3 个 360 秒……
+      # 第 1 个账号 0 秒，第 2 个 90 秒，第 3 个 180 秒……
       # 配合 max-parallel: 1，账号之间就真的隔开了。
+      # 90 秒是权衡：够错开，又不会把后面的账号拖到超时。
       - name: 错峰等待（第 ${{ matrix.seq }} 个账号）
         run: |
-          W=$(( ${{ matrix.seq }} * 180 ))
+          W=$(( ${{ matrix.seq }} * 90 ))
           if [ "$W" -gt 0 ]; then
             echo "第 ${{ matrix.seq }} 个账号，等待 ${W} 秒后开始"
             sleep "$W"
