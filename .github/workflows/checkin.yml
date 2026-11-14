@@ -76,12 +76,12 @@ jobs:
             case "$t" in ''|*[!0-9]*) continue ;; esac
             [ "${#t}" -eq 4 ] || continue
             [ -z "$items" ] || items="$items,"
-            items="$items{\"tail\":\"$t\",\"env\":\"acct-$t\"}"
+            items="$items{\"tail\":\"$t\",\"env\":\"acct-$t\",\"seq\":$n}"
             n=$((n + 1))
           done
           if [ "$n" -eq 0 ]; then
             # 占位矩阵：避免空 matrix 导致调度异常；count=0 会让动态 job 跳过
-            echo 'matrix={"include":[{"tail":"none","env":"none"}]}' >> "$GITHUB_OUTPUT"
+            echo 'matrix={"include":[{"tail":"none","env":"none","seq":0}]}' >> "$GITHUB_OUTPUT"
           else
             # matrix 必须是对象（include 列表），不能是裸数组，否则 job 无法创建
             echo "matrix={\"include\":[$items]}" >> "$GITHUB_OUTPUT"
@@ -115,6 +115,11 @@ jobs:
       SUCCESS_NOTIFY: ${{ secrets.SUCCESS_NOTIFY }}
 
     steps:
+
+      # ── 错峰等待（尾号6717 排在第一个，等 2 分钟让调度波峰过去）──────────
+      # 多账号同时打同一个接口容易被当成异常流量，错开几分钟更稳。
+      - name: 错峰等待 120 秒
+        run: sleep 120
       - name: 检出仓库
         uses: actions/checkout@v4
 
@@ -211,6 +216,11 @@ jobs:
       SUCCESS_NOTIFY: ${{ secrets.SUCCESS_NOTIFY }}
 
     steps:
+
+      # ── 错峰等待（尾号7100 排在 6717 之后，等 5 分钟）──────────
+      # 多账号同时打同一个接口容易被当成异常流量，错开几分钟更稳。
+      - name: 错峰等待 300 秒
+        run: sleep 300
       - name: 检出仓库
         uses: actions/checkout@v4
 
@@ -287,6 +297,9 @@ jobs:
     timeout-minutes: 10
     strategy:
       fail-fast: false   # 某账号失败不影响其他账号
+      # 多账号【串行】：同时打同一接口容易被判异常。这是 GitHub 唯一能控制
+      # 「账号之间间隔」的手段（matrix 默认是并行的）。
+      max-parallel: 1
       matrix: ${{ fromJson(needs.prepare_accounts.outputs.matrix) }}
     environment: acct-${{ matrix.tail }}
 
@@ -307,6 +320,19 @@ jobs:
       SUCCESS_NOTIFY: ${{ secrets.SUCCESS_NOTIFY }}
 
     steps:
+
+      # ── 错峰等待（其余账号按序号递增，每多一个加 180 秒）──────────
+      # 第 1 个账号 0 秒，第 2 个 180 秒，第 3 个 360 秒……
+      # 配合 max-parallel: 1，账号之间就真的隔开了。
+      - name: 错峰等待（第 ${{ matrix.seq }} 个账号）
+        run: |
+          W=$(( ${{ matrix.seq }} * 180 ))
+          if [ "$W" -gt 0 ]; then
+            echo "第 ${{ matrix.seq }} 个账号，等待 ${W} 秒后开始"
+            sleep "$W"
+          else
+            echo "第 1 个账号，不等待"
+          fi
       - name: 检出仓库
         uses: actions/checkout@v4
 
