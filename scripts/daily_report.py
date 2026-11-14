@@ -115,6 +115,11 @@ def build_text(rows, title, run_url=None):
         if run_url:
             lines.append("运行详情：%s" % run_url)
         return "\n".join(lines)
+    # 缺口可见：少一个号时，数量本身就能提醒（小浣熊播报同一处理）
+    bad = [r for r in rows if not r["has_data"]]
+    lines.append("本次收到 %d 个账号的积分数据%s" % (
+        len(rows), ("，其中 %d 个未取到（见上方）" % len(bad)) if bad else ""))
+    lines.append("")
     for i, r in enumerate(rows, 1):
         lines.append("%d. %s" % (i, r["account"]))
         lines.append("   当前积分：%s" % ("%g 分" % r["credits"] if r["has_data"] else "未取到"))
