@@ -924,7 +924,9 @@ def _win_toast(title, body):
 
 def run(check_only):
     result = {"status": "unknown", "action": None, "points": None,
-              "balance": None, "msg": "", "detail": {}}
+              "balance": None, "msg": "", "detail": {},
+              # 每日积分播报用它作为账号行标题（只含尾号，不含任何凭据）
+              "account": (os.environ.get("WB_ACCOUNT_LABEL") or "").strip()}
 
     # 1) 解析凭据（长效令牌 > 短效令牌 > 本机登录态文件）
     token, domain, err = resolve_credential(result)
