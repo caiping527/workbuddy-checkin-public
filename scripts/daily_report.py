@@ -25,12 +25,14 @@ result.json 里的积分字段（由各签到脚本写入，二选一，本脚�
 """
 
 import glob
+import io
 import json
 import os
 import re
 import sys
 import urllib.parse
 import urllib.request
+import uuid
 from datetime import date, datetime, timedelta, timezone
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -84,6 +86,162 @@ def fit_plain(text, limit=1900):
         size += n
     out.append("…内容过长已截断，完整数据见运行详情")
     return "\n".join(out)
+
+
+# ── 彩色图卡（微信端唯一能上色的消息类型是 image）──────────
+# 微信只渲染 text / image；markdown 会被提示「暂不支持此消息类型」，
+# textcard 的 div 配色也不生效（实测）。所以彩色只能自己画成 PNG。
+FONT_CANDIDATES = (
+    r"C:\Windows\Fonts\simhei.ttf",
+    "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+    "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/arphic/uming.ttc",
+)
+IMG_COLORS = {"info": (200, 35, 44), "warning": (232, 83, 31), "comment": (120, 120, 120)}
+IMG_WIDTH, IMG_PAD = 780, 28
+_TOKEN_RE = re.compile(r'<font color="(\w+)">(.*?)</font>|\*\*(.+?)\*\*', re.S)
+
+
+def _font_path():
+    for p in FONT_CANDIDATES:
+        if os.path.isfile(p):
+            return p
+    return ""
+
+
+def _segments(line):
+    """把一行 markdown 拆成 [(文字, 颜色, 是否加粗)]，没有标签的段落给 None。"""
+    out, pos = [], 0
+    for m in _TOKEN_RE.finditer(line):
+        if m.start() > pos:
+            out.append((line[pos:m.start()], None, False))
+        if m.group(1):
+            out.append((m.group(2), IMG_COLORS.get(m.group(1), (34, 34, 34)), False))
+        else:
+            out.append((m.group(3), None, True))
+        pos = m.end()
+    if pos < len(line):
+        out.append((line[pos:], None, False))
+    return [s for s in out if s[0]]
+
+
+# 中日韩字体没有 emoji 字形，直接画会变成方框；换成同义符号。
+_GLYPH_FIX = {"⚠️": "▲", "⚠": "▲", "✅": "√", "❌": "×", "⏭": "»",
+              "👉": "→", "🔴": "●", "🟢": "●", "\ufe0f": ""}
+
+
+def _plain_glyphs(text):
+    for k, v in _GLYPH_FIX.items():
+        text = text.replace(k, v)
+    return text
+
+
+def _break_units(text):
+    """把一段文字切成折行单元：连续的 ASCII（数字/日期/符号）算一个整体，
+    避免把 2026-12-04 这种日期从中间劈开；中文逐字成单元。"""
+    units, buf = [], ""
+    for ch in text:
+        if ch.isascii() and not ch.isspace():
+            buf += ch
+            continue
+        if buf:
+            units.append(buf)
+            buf = ""
+        units.append(ch)
+    if buf:
+        units.append(buf)
+    return units
+
+
+_TRAILING_PUNCT = "：；，。、）」』】！？%"
+
+
+def render_png(text):
+    """把播报渲染成 PNG 字节流；缺 Pillow 或中文字体时返回 None（调用方退回纯文本）。"""
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except Exception:  # noqa: BLE001 —— 云端没装 Pillow 就走纯文本
+        return None
+    fp = _font_path()
+    if not fp:
+        return None
+    try:
+        f_title = ImageFont.truetype(fp, 34)
+        f_body = ImageFont.truetype(fp, 26)
+    except Exception:  # noqa: BLE001
+        return None
+
+    rows = text.split("\n")
+    while rows and not rows[0].strip():
+        rows.pop(0)
+    while rows and not rows[-1].strip():
+        rows.pop()
+
+    # 先按像素宽度折行，得到 [(字体, [(文字, 字体, 颜色)])]
+    wrapped = []
+    for idx, line in enumerate(rows):
+        title = idx == 0
+        font = f_title if title else f_body
+        if not line.strip():
+            wrapped.append((font, []))
+            continue
+        cur, cur_w = [], 0.0
+        for chunk, color, _bold in _segments(_plain_glyphs(line)):
+            color = color or ((20, 20, 20) if title else (34, 34, 34))
+            for unit in _break_units(chunk):
+                w = font.getlength(unit)
+                # 收尾标点允许轻微越界，避免「：」被顶到下一行单独成行
+                over_ok = unit in _TRAILING_PUNCT and cur
+                if cur_w + w > IMG_WIDTH - IMG_PAD * 2 and cur and not over_ok:
+                    wrapped.append((font, cur))
+                    cur, cur_w = [], 0.0
+                if cur and cur[-1][1] is font and cur[-1][2] == color:
+                    cur[-1] = (cur[-1][0] + unit, font, color)
+                else:
+                    cur.append((unit, font, color))
+                cur_w += w
+        wrapped.append((font, cur))
+
+    height = IMG_PAD * 2
+    for font, segs in wrapped:
+        height += 48 if font is f_title else (18 if not segs else 40)
+    img = Image.new("RGB", (IMG_WIDTH, height), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    y = IMG_PAD
+    for font, segs in wrapped:
+        if not segs:
+            y += 18
+            continue
+        x = IMG_PAD
+        for s, f, color in segs:
+            draw.text((x, y), s, font=f, fill=color)
+            x += f.getlength(s)
+        y += 48 if font is f_title else 40
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    return buf.getvalue()
+
+
+def upload_image(token, png):
+    """上传临时素材拿 media_id；失败返回空串（调用方退回纯文本）。"""
+    boundary = "----wb%d" % uuid.uuid4().int
+    body = b"".join([
+        ("--%s\r\n" % boundary).encode(),
+        b'Content-Disposition: form-data; name="media"; filename="report.png"\r\n',
+        b"Content-Type: image/png\r\n\r\n", png, b"\r\n",
+        ("--%s--\r\n" % boundary).encode(),
+    ])
+    req = urllib.request.Request(
+        "%s/media/upload?access_token=%s&type=image" % (QYAPI, token),
+        data=body, method="POST",
+        headers={"Content-Type": "multipart/form-data; boundary=%s" % boundary})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            out = json.loads(resp.read().decode("utf-8", "replace"))
+        return out.get("media_id") or ""
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def truthy(v):
@@ -253,13 +411,30 @@ def push_app(value, content):
     if t.get("errcode") != 0:
         return "app:gettoken失败 %s" % t.get("errmsg")
     send_url = "%s/message/send?access_token=%s" % (QYAPI, t["access_token"])
-    # 应用消息固定发 text：收件人多数在微信里看（微信只渲染 text/image）。
-    # markdown 会显示「暂不支持此消息类型」，textcard 的 div 配色也不生效。
+    token = t["access_token"]
+    note = ""
+    # 1) 先发彩色图卡：微信端只认 text / image，彩色只能画成图
+    png = render_png(content)
+    if png:
+        media_id = upload_image(token, png)
+        if media_id:
+            r = post_json(send_url, {
+                "touser": touser, "msgtype": "image", "agentid": agentid,
+                "image": {"media_id": media_id}, "safe": 0,
+            })
+            if r.get("errcode") == 0:
+                return "app:图卡 ok msgid=%s" % (r.get("msgid") or "-")
+            note = "图卡被拒(%s)降级text " % (r.get("errmsg") or r.get("errcode"))
+        else:
+            note = "图卡上传失败降级text "
+    else:
+        note = "无Pillow/字体降级text "
+    # 2) 兜底纯文本（没颜色但一定看得见）
     r = post_json(send_url, {
         "touser": touser, "msgtype": "text", "agentid": agentid,
         "text": {"content": fit_plain(content)}, "safe": 0,
     })
-    bits = ["errcode=%s" % r.get("errcode"),
+    bits = ["%serrcode=%s" % (note, r.get("errcode")),
             "errmsg=%s" % (r.get("errmsg") or "-")]
     if r.get("invaliduser"):
         bits.append("invaliduser=%s" % r["invaliduser"])
