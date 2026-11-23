@@ -19,8 +19,9 @@ result.json 里的积分字段（由各签到脚本写入，二选一，本脚�
   python daily_report.py _report --title Qoder
 开关：RECOMMEND_NOTIFY=0 / off / false / no / none / disabled 关闭推送
 通道：WECOM_WEBHOOK（群机器人完整 webhook 或仅 key）、WECOM_APP（corpid,corpsecret,touser,agentid）
-排版：企微 markdown，积分 / 到期日 / 剩余天数用彩色字（企微只支持 info 绿 /
-      warning 橙红 / comment 灰）；通道不支持 markdown 时自动降级为纯文本。
+排版：应用消息固定发 text（微信端只渲染 text / image，markdown 会显示
+      「暂不支持此消息类型」）；群机器人 webhook 保留 markdown 彩色。
+      两个通道渲染同一份内容，颜色只在企业微信群里有意义。
 """
 
 import glob
@@ -252,18 +253,13 @@ def push_app(value, content):
     if t.get("errcode") != 0:
         return "app:gettoken失败 %s" % t.get("errmsg")
     send_url = "%s/message/send?access_token=%s" % (QYAPI, t["access_token"])
+    # 应用消息固定发 text：收件人多数在微信里看（微信只渲染 text/image）。
+    # markdown 会显示「暂不支持此消息类型」，textcard 的 div 配色也不生效。
     r = post_json(send_url, {
-        "touser": touser, "msgtype": "markdown", "agentid": agentid,
-        "markdown": {"content": content}, "safe": 0,
+        "touser": touser, "msgtype": "text", "agentid": agentid,
+        "text": {"content": fit_plain(content)}, "safe": 0,
     })
-    downgraded = ""
-    if r.get("errcode") not in (0, None):
-        downgraded = "降级text(%s) " % (r.get("errmsg") or r.get("errcode"))
-        r = post_json(send_url, {
-            "touser": touser, "msgtype": "text", "agentid": agentid,
-            "text": {"content": fit_plain(content)}, "safe": 0,
-        })
-    bits = ["%serrcode=%s" % (downgraded, r.get("errcode")),
+    bits = ["errcode=%s" % r.get("errcode"),
             "errmsg=%s" % (r.get("errmsg") or "-")]
     if r.get("invaliduser"):
         bits.append("invaliduser=%s" % r["invaliduser"])
