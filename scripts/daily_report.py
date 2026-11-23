@@ -69,6 +69,22 @@ def fit_markdown(text):
     return "\n".join(out)
 
 
+def fit_plain(text, limit=1900):
+    """纯文本兜底也要限长：企微 text 消息上限 2048 字节。"""
+    text = strip_color(text)
+    if len(text.encode("utf-8")) <= limit:
+        return text
+    out, size = [], 0
+    for line in text.split("\n"):
+        n = len(line.encode("utf-8")) + 1
+        if size + n > limit - 60:
+            break
+        out.append(line)
+        size += n
+    out.append("…内容过长已截断，完整数据见运行详情")
+    return "\n".join(out)
+
+
 def truthy(v):
     return str(v or "").strip().lower() in ("1", "true", "yes", "on")
 
@@ -219,7 +235,7 @@ def push_webhook(value, content):
         return "webhook:%s" % (r.get("errmsg") or "ok")
     # 通道不支持 / 拒收 markdown：降级纯文本，保证消息一定送到
     first = r.get("errmsg") or r.get("errcode")
-    r = post_json(url, {"msgtype": "text", "text": {"content": strip_color(content)}})
+    r = post_json(url, {"msgtype": "text", "text": {"content": fit_plain(content)}})
     return "webhook:markdown失败(%s)降级text:%s" % (
         first, r.get("errmsg") or r.get("errcode"))
 
@@ -245,7 +261,7 @@ def push_app(value, content):
         downgraded = "降级text(%s) " % (r.get("errmsg") or r.get("errcode"))
         r = post_json(send_url, {
             "touser": touser, "msgtype": "text", "agentid": agentid,
-            "text": {"content": strip_color(content)}, "safe": 0,
+            "text": {"content": fit_plain(content)}, "safe": 0,
         })
     bits = ["%serrcode=%s" % (downgraded, r.get("errcode")),
             "errmsg=%s" % (r.get("errmsg") or "-")]
