@@ -537,6 +537,7 @@ def query_balance_expiry(base, token):
             return {"error": "余额响应缺少 Accounts"}
         now_ms = int(now.timestamp() * 1000)
         credits, earliest, earliest_remaining = 0.0, 0, 0.0
+        batches = []  # 每个待用批次的剩余与到期，供播报算「三天内过期合计」
         for acc in accounts:
             if not isinstance(acc, dict):
                 continue
@@ -556,12 +557,14 @@ def query_balance_expiry(base, token):
                    or _parse_expiry_ms(acc.get("PackageEndTime"))
                    or _parse_expiry_ms(acc.get("CycleEndTime")))
             if exp and exp > now_ms:
+                batches.append({"remaining": round(remain, 2), "expireAt": exp})
                 if not earliest or exp < earliest:
                     earliest, earliest_remaining = exp, remain
                 elif exp == earliest:
                     earliest_remaining += remain
         out = {"credits": round(credits, 2),
                "earliest_remaining": round(earliest_remaining, 2),
+               "batches": batches,
                "label": "开始过期"}
         if earliest:
             exp_day = datetime.fromtimestamp(earliest / 1000.0, BEIJING).date()
