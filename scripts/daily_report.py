@@ -93,6 +93,17 @@ def load_rows(root):
         err = str(exp.get("error") or "")
         credits = num(exp.get("credits")) if not err else 0.0
         days = exp.get("days_left")
+        batches = []
+        for b in (exp.get("batches") or []):
+            if not isinstance(b, dict):
+                continue
+            try:
+                exp_ms = int(float(b.get("expireAt") or 0))
+            except (TypeError, ValueError):
+                exp_ms = 0
+            leftover = num(b.get("remaining"))
+            if exp_ms > 0 and leftover > 0:
+                batches.append({"remaining": leftover, "expireAt": exp_ms})
         rows.append({
             "account": account,
             "status": status,
@@ -104,6 +115,7 @@ def load_rows(root):
             "remaining": num(exp.get("earliest_remaining")),
             "use_by": str(exp.get("use_by") or ""),
             "label": str(exp.get("label") or "开始过期"),
+            "batches": batches,
             "error": err,
         })
     # 与 AiRoute「积分先到期先用」一致：到期日近的在前；同日则临期待用积分
@@ -113,17 +125,53 @@ def load_rows(root):
     return rows
 
 
+def account_label(name):
+    """播报统一写「尾号 xxxx」；已经是尾号就不重复加。"""
+    text = str(name or "").strip()
+    if text.startswith("尾号"):
+        return text
+    digits = re.sub(r"\D", "", text)
+    if len(digits) >= 4:
+        return "尾号" + digits[-4:]
+    return text or "未命名账号"
+
+
+def three_day_amount(r):
+    """从最早到期日开始的三天（含当天）要过期多少分。
+
+    有批次明细就按日期求和；老结果没有 batches，退回「最早那一批」的剩余。
+    """
+    if not r["batches"] or not r["expire_date"]:
+        return r["remaining"]
+    start = date.fromisoformat(r["expire_date"])
+    total = 0.0
+    for b in r["batches"]:
+        try:
+            day = datetime.fromtimestamp(b["expireAt"] / 1000.0, BEIJING).date()
+        except (OverflowError, OSError, ValueError):
+            continue
+        if start <= day <= start + timedelta(days=2):
+            total += b["remaining"]
+    return round(total, 2) if total > 0 else r["remaining"]
+
+
 def expiry_lines(r):
-    """一个账号的到期说明，返回带 emoji 色标的纯文本行。"""
+    """一个账号的到期说明：几天后开始过期、三天内合计多少、建议哪天前用掉。"""
     if not r["has_data"]:
         return ["⚪ 积分数据未取到"]
     if not r["expire_date"]:
         return ["⚪ 当前积分未标注到期日"]
-    lines = ["📅 %s %s，剩 %s 天，这批 %g 分" % (
-        r["expire_date"], r["label"],
-        r["days_left"] if r["days_left"] is not None else "?", r["remaining"])]
-    if isinstance(r["days_left"], (int, float)) and r["days_left"] <= 1:
-        lines.append("⏰ 今明两天就到期，今天就用掉")
+    days = r["days_left"]
+    if isinstance(days, (int, float)):
+        when = "今天" if days <= 0 else "明天" if days == 1 else "%s 天后" % days
+    else:
+        when = "?"
+    three = three_day_amount(r)
+    lines = ["📅 %s，%s 开始，三天内过期 %g 分" % (when, r["expire_date"], three)]
+    if isinstance(days, (int, float)) and days <= 0:
+        lines.append("⏰ 今天就到期，尽快用掉")
+    elif isinstance(days, (int, float)) and days == 1:
+        lines.append("⏰ 明天就到期，今天用掉")
     elif r["use_by"]:
         lines.append("⏰ 建议 %s 前用掉（提前一天）" % r["use_by"])
     return lines
@@ -144,7 +192,7 @@ def build_text(rows, title, run_url=None):
         len(rows), "，%d 个未取到" % len(bad) if bad else "，全部正常"))
     for r in rows:
         lines.append("")
-        lines.append(("🟩 " if r["has_data"] else "🟥 ") + r["account"])
+        lines.append(("🟩 " if r["has_data"] else "🟥 ") + account_label(r["account"]))
         if r["has_data"]:
             lines.append("💰 当前积分 %g 分" % r["credits"])
             for part in expiry_lines(r):
@@ -157,7 +205,8 @@ def build_text(rows, title, run_url=None):
     soon = [r for r in rows if r["has_data"] and r["days_left"] is not None and r["days_left"] <= 7]
     lines.append("")
     if soon:
-        lines.append("📣 今天优先用 %s 跑代码，临期的先用，别拖到过期当天" % soon[0]["account"])
+        lines.append("📣 今天优先用 %s 跑代码，临期的先用，别拖到过期当天"
+                     % account_label(soon[0]["account"]))
     else:
         lines.append("⚪ 近 7 天没有临期积分，不用特意切号")
     lines.append("⚪ 注：数据取云端只读余额查询，与 AiRoute「积分先到期先用」口径一致")
@@ -169,19 +218,20 @@ def build_text(rows, title, run_url=None):
 def build_report(rows, title):
     """Markdown 榜单，写进 Actions Summary。"""
     lines = ["#### %s · 每日积分播报（按最早到期日排序）" % title, "",
-             "| 排名 | 账号 | 当前积分 | 到期日 | 剩几天 | 该批积分 | 建议用掉日 | 签到状态 |",
+             "| 排名 | 账号 | 当前积分 | 到期日 | 剩几天 | 三天内过期 | 建议用掉日 | 签到状态 |",
              "| --- | --- | --- | --- | --- | --- | --- | --- |"]
     for i, r in enumerate(rows, 1):
         lines.append("| %d | %s | %s | %s | %s | %s | %s | %s |" % (
-            i, r["account"],
+            i, account_label(r["account"]),
             "**%g**" % r["credits"] if r["has_data"] else "未取到",
             r["expire_date"] or "—",
             r["days_left"] if r["days_left"] is not None else "—",
-            "%g 分" % r["remaining"] if r["has_data"] else "—",
+            "%g 分" % three_day_amount(r) if r["has_data"] else "—",
             r["use_by"] or "—",
             "失败" if r["status"] in ("error", "failed") else "成功"))
     lines.append("")
-    lines.append("> 当前积分取云端只读余额接口；到期日取「还没用掉且最早到期」的那一批积分。")
+    lines.append("> 当前积分取云端只读余额接口；到期日取「还没用掉且最早到期」的那一批，"
+                 "三天内过期 = 该日起 3 天内到期的批次合计。")
     if not rows:
         lines.append("")
         lines.append("- 本次没有收到任何账号的积分数据。")
