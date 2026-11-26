@@ -126,10 +126,11 @@ def load_rows(root):
 
 
 def account_label(name):
-    """播报统一写「尾号 xxxx」；已经是尾号就不重复加。"""
+    """播报统一写「尾号 xxxx」；已经是尾号就归一化，不重复加。"""
     text = str(name or "").strip()
     if text.startswith("尾号"):
-        return text
+        digits = re.sub(r"\D", "", text)
+        return "尾号" + digits[-4:] if len(digits) >= 4 else text
     digits = re.sub(r"\D", "", text)
     if len(digits) >= 4:
         return "尾号" + digits[-4:]
