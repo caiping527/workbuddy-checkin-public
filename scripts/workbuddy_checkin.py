@@ -77,6 +77,7 @@ if sys.version_info < (3, 6):
 import json
 import os
 import socket
+import shutil
 import subprocess
 import time
 import urllib.request
@@ -125,6 +126,12 @@ BEIJING = timezone(timedelta(hours=8))
 PLUGIN_API = "https://copilot.tencent.com"
 REFRESH_PATH = "/v2/plugin/auth/token/refresh"
 PLUGIN_DOMAIN = "copilot.tencent.com"
+
+# 刷新出来的新长效令牌暂存（内存级，进程结束即丢，绝不落盘/进日志）。
+# 为什么需要：上游每条 refreshToken 只能用一次，刷完立刻作废旧的。
+# 云端每天刷一次，如果新令牌不回写 Secret，第二天拿旧的就是 12153，
+# 整条链被上游作废 —— 这正是「以前总是失败一次就得重新收验证码」的真因。
+_NEW_RT_HOLDER = {"rt": ""}
 
 # 失败推送配置（含密钥，仅本地，不入库）
 NOTIFY_CONFIG = os.path.join(os.path.expanduser("~"),
@@ -335,6 +342,9 @@ def resolve_credential(result):
         result["detail"]["rt_rotated"] = bool(new_rt and new_rt != rt)
         result["detail"]["token_masked"] = mask_token(new_at)
         result["detail"]["auth_file"] = "(env: WB_REFRESH_TOKEN)"
+        # 轮换出来的新 RT 必须能被上层拿去回写 Secret，否则第二天必然 12153。
+        # 只在内存里递给 run()，绝不写进 result/detail（那会进公开日志）。
+        _NEW_RT_HOLDER["rt"] = new_rt or ""
         return new_at, (env_domain or "www.codebuddy.cn"), None
 
     if at:
@@ -799,7 +809,7 @@ def notify_failure(res):
         "> **原因**：%s\n\n"
         "> **凭据来源**：%s\n\n"
         "> **处理建议**：若为定时任务（GitHub Actions），请先确认客户端登录的是"
-        "来源里的那个尾号，再双击本机的「一键更新.bat」"
+        "来源里的那个尾号，再双击本机的「签到配置.pyw」"
         "（工具自动认号并写入 Secret `%s`）；"
         "若为本机运行，请确认客户端已登录、电脑联网。\n"
     ) % (origin, now, msg, src, token_secret)
@@ -952,7 +962,7 @@ def run(check_only):
         secret_name = (os.environ.get("WB_TOKEN_SECRET_NAME") or "WB_REFRESH_TOKEN").strip()
         result.update(status="error", action=None, msg=(
             "凭据归属不符：本任务标注为 %s，但 Secret 里的令牌属于尾号%s。"
-            "请在本机登录尾号%s 后双击「一键更新.bat」重新写入 %s。"
+            "请在本机登录尾号%s 后双击「签到配置.pyw」重新写入 %s。"
         ) % (label, cred_tail, expected, secret_name))
         return result
     result["detail"]["credential_check"] = "ok" if (expected and cred_tail) else "skipped"
@@ -1085,6 +1095,60 @@ def write_log(res):
             f.write(line)
     except Exception:
         pass  # 写日志失败绝不影响签到
+
+
+# ---------------- 新长效令牌回写 Secret ----------------
+# 为什么必须有这一步：
+#   上游 refreshToken 是一次性凭据，刷完旧的立刻作废。云端每天签到都会刷一次，
+#   如果刷出来的新令牌不写回 Secret，第二天拿的还是旧的 → 12153 revoked →
+#   整条链被上游作废，只能人工重新收验证码。这就是反复失败的根因。
+# 安全要求：
+#   令牌只经 stdin 喂给 gh，绝不打印、绝不进 GITHUB_STEP_SUMMARY、绝不进 result。
+#   失败只记一句「回写失败」+ 原因摘要，不影响签到结论与退出码。
+
+def push_new_refresh_token(new_rt):
+    """把刷新得到的新长效令牌写回当前账号对应环境的 Secret。
+
+    返回 (ok, msg)。未配置回写条件时返回 (False, '未启用')。
+    """
+    if not new_rt:
+        return False, "没有新令牌"
+    token = (os.environ.get("GH_PAT") or os.environ.get("GH_TOKEN")
+             or os.environ.get("GITHUB_TOKEN") or "").strip()
+    repo = (os.environ.get("GH_REPO") or os.environ.get("GITHUB_REPOSITORY") or "").strip()
+    secret = (os.environ.get("WB_TOKEN_SECRET_NAME") or "WB_REFRESH_TOKEN").strip()
+    # Secret 名可能带「（环境 acct-xxxx）」这类人类可读后缀，这里剥掉
+    secret = secret.split("（")[0].split("(")[0].strip() or "WB_REFRESH_TOKEN"
+    if not token or not repo:
+        return False, "未配置 GH_PAT / GH_REPO，跳过回写"
+    # WB_TOKEN_SECRET_NAME 被写成「环境 acct-xxxx」形式时，环境名从变量里拿
+    env_name = (os.environ.get("WB_ENV_NAME") or "").strip()
+
+    gh = shutil.which("gh") or "gh"
+    args = [gh, "secret", "set", secret, "--repo", repo]
+    if env_name:
+        args += ["--env", env_name]
+    try:
+        env = dict(os.environ)
+        env["GH_TOKEN"] = token
+        r = subprocess.run(args, input=new_rt, capture_output=True, text=True,
+                           timeout=90, env=env, encoding="utf-8", errors="replace")
+    except Exception as e:
+        return False, "调用 gh 失败: %s" % type(e).__name__
+    if r.returncode == 0:
+        return True, "已回写 %s%s" % (secret, (" @" + env_name) if env_name else "")
+    return False, ((r.stderr or r.stdout or "").strip()[:160] or "gh 返回非 0")
+
+
+def maybe_push_new_token(res):
+    """签到后统一处理回写。只在拿到了新令牌时才动作。"""
+    new_rt = _NEW_RT_HOLDER.get("rt") or ""
+    if not new_rt:
+        return
+    details = res.setdefault("detail", {})
+    ok, msg = push_new_refresh_token(new_rt)
+    details["rt_pushback"] = ("ok: " + msg) if ok else ("skip/fail: " + msg)
+    _NEW_RT_HOLDER["rt"] = ""   # 用掉即清，防止二次写出
 
 
 # ---------------- 环境自检与配置模板 ----------------
@@ -1288,6 +1352,13 @@ def main():
     except Exception as e:
         res = {"status": "error", "action": None, "points": None,
                "msg": "脚本未捕获异常: %s" % e, "detail": {}}
+    # 新长效令牌回写 Secret（防止第二天拿旧令牌被上游作废）
+    # 无论签到成功与否都尝试：只要这次刷新拿到了新令牌，就必须写回去，
+    # 否则这条链等于白刷，明天必然 12153。
+    try:
+        maybe_push_new_token(res)
+    except Exception as e:
+        res.setdefault("detail", {})["rt_pushback"] = "异常: %s" % type(e).__name__
     # 输出结果（不含任何真实 token）
     # 失败推送（配置缺失则跳过；--no-notify 用于调试）
     if not no_notify and res.get("status") != "ok":
