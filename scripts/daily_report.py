@@ -118,11 +118,39 @@ def load_rows(root):
             "batches": batches,
             "error": err,
         })
-    # 与 AiRoute「积分先到期先用」一致：到期日近的在前；同日则临期待用积分
-    # 多的在前（最该先消耗）；再按总积分、账号名稳定排序。
+    # 与 AiRoute「积分先到期先用」一致：到期日近的在前；同日则三天内到期
+    # 合计多的在前（最该先消耗）；再按最早一批剩余、总积分、账号名稳定排序。
     rows.sort(key=lambda r: (r["days_left"] if r["days_left"] is not None else 999,
+                             -three_day_amount(r),
                              -r["remaining"], -r["credits"], r["account"]))
     return rows
+
+
+def pick_today(rows, window=7):
+    """今天该用哪些号：取「最早到期日」那一组，同一天的都算。
+
+    一天的消耗量有限，同一天有多个号到期时要轮着用，只推一个号会漏掉另一个。
+    """
+    cand = [r for r in rows
+            if r["has_data"] and r["days_left"] is not None and r["days_left"] <= window]
+    if not cand:
+        return []
+    first = min(r["days_left"] for r in cand)
+    return [r for r in cand if r["days_left"] == first]
+
+
+def today_sentence(rows):
+    """推荐句：把最早到期那一组号全列出来，附上合计到期分。"""
+    picked = pick_today(rows)
+    if not picked:
+        return "⚪ 近 7 天没有临期积分，不用特意切号"
+    days = picked[0]["days_left"]
+    when = "今天" if days <= 0 else "明天" if days == 1 else "%s 天后" % days
+    names = "、".join(account_label(r["account"]) for r in picked)
+    total = sum(three_day_amount(r) for r in picked)
+    extra = "，三天内共 %g 分要过期" % total if total else ""
+    return "📣 今天优先用 %s —— %s开始过期（%s）%s" % (
+        names, picked[0]["expire_date"], when, extra)
 
 
 def account_label(name):
@@ -203,13 +231,15 @@ def build_text(rows, title, run_url=None):
             lines.append("❗ 积分未取到：%s" % reason)
         if r["has_data"] and r["status"] in ("error", "failed") and r["message"]:
             lines.append("❗ 签到异常：%s" % r["message"][:60])
-    soon = [r for r in rows if r["has_data"] and r["days_left"] is not None and r["days_left"] <= 7]
+    soon = [r for r in rows
+            if r["has_data"] and r["days_left"] is not None and r["days_left"] <= 2]
     lines.append("")
     if soon:
-        lines.append("📣 今天优先用 %s 跑代码，临期的先用，别拖到过期当天"
-                     % account_label(soon[0]["account"]))
-    else:
-        lines.append("⚪ 近 7 天没有临期积分，不用特意切号")
+        lines.append("⚠️ 近 2 天内到期：%s"
+                     % "、".join("%s（%s，剩 %s 天）"
+                                % (account_label(r["account"]), r["expire_date"],
+                                   r["days_left"]) for r in soon))
+    lines.append(today_sentence(rows))
     lines.append("⚪ 注：数据取云端只读余额查询，与 AiRoute「积分先到期先用」口径一致")
     if run_url:
         lines.append("🔗 运行详情：%s" % run_url)
