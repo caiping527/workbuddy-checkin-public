@@ -16,7 +16,7 @@ name: WorkBuddy 每日自动签到
 #    每个尾号对应一个 Environment `acct-<尾号>`，环境内存放与仓库级**同名**的
 #    WB_REFRESH_TOKEN / WB_DOMAIN。job 通过 `environment: acct-<尾号>` 取用，
 #    环境级 Secret 会覆盖仓库级同名 Secret，因此各账号互不干扰。
-#    新增账号只需在本机登录该号后运行「一键更新.bat」：
+#    新增账号只需在本机登录该号后运行「签到配置.pyw」：
 #    工具自动建 Environment、写入令牌、把尾号追加进 WB_ACCOUNTS，
 #    无需修改本文件、无需在网页上手动加 Secret。
 #
@@ -50,6 +50,8 @@ concurrency:
 
 permissions:
   contents: read
+  # 令牌回写需要写权限（用 GH_PAT 时按 PAT 自身权限走，这行是兜底）
+  actions: read
 
 jobs:
   # ── 读取「动态账号」列表，生成 matrix ──────────────────────────
@@ -104,6 +106,13 @@ jobs:
       # 推送与摘要里的账号标识（单账号部署也可留空，不影响原行为）
       WB_ACCOUNT_LABEL: '尾号6717'
       WB_TOKEN_SECRET_NAME: 'WB_REFRESH_TOKEN'
+      # ── 新长效令牌回写 ────────────────────────────────────
+      # 上游 RT 一次性：刷完旧的立刻作废。不回写的话，第二天拿旧的就是 12153，
+      # 整条链被作废、只能人工重新收验证码。这三个变量就是为回写服务的。
+      # GH_PAT 需要 repo scope（能改 Actions Secret）；用默认 GITHUB_TOKEN 改不了 Secret。
+      GH_PAT: ${{ secrets.GH_PAT }}
+      GH_REPO: ${{ github.repository }}
+      WB_ENV_NAME: ''
       # 尾号6717 是必跑项；缺凭据应报错告警
       CREDENTIAL_REQUIRED: 'true'
       # 通知通道（各账号共用，可选，任一为空则跳过该通道）
@@ -216,6 +225,10 @@ jobs:
       WB_DOMAIN: ${{ secrets.WB_DOMAIN_2 || secrets.WB_DOMAIN }}
       WB_ACCOUNT_LABEL: '尾号7100'
       WB_TOKEN_SECRET_NAME: 'WB_REFRESH_TOKEN_2'
+      # 新长效令牌回写（同上，缺了会第二天 12153）
+      GH_PAT: ${{ secrets.GH_PAT }}
+      GH_REPO: ${{ github.repository }}
+      WB_ENV_NAME: ''
       # 尾号7100 为可选项：未配置凭据则整组步骤跳过
       CREDENTIAL_REQUIRED: 'false'
       WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
@@ -329,6 +342,10 @@ jobs:
       WB_DOMAIN: ${{ secrets.WB_DOMAIN }}
       WB_ACCOUNT_LABEL: 尾号${{ matrix.tail }}
       WB_TOKEN_SECRET_NAME: 'WB_REFRESH_TOKEN（环境 acct-${{ matrix.tail }}）'
+      # 新长效令牌回写：必须写进本账号的环境里（同名 Secret 会被环境级覆盖）
+      GH_PAT: ${{ secrets.GH_PAT }}
+      GH_REPO: ${{ github.repository }}
+      WB_ENV_NAME: acct-${{ matrix.tail }}
       # 动态账号属严格项：拿不到本环境的凭据就报错，
       # 绝不静默回退到仓库级（那可能拿到别的账号的令牌）
       CREDENTIAL_REQUIRED: 'true'
